@@ -1,0 +1,29 @@
+# Run stock cache warmer every day at 7:00 AM (before market opens)
+# Make sure to replace /path/to with your actual path
+# Format: minute hour day month weekday command
+
+# Example with direct API key:
+0 7 * * 1-5 FINNHUB_API_KEY="your-api-key" /path/to/openwebui_tools/warm_cache.sh >> /path/to/openwebui_tools/cron.log 2>&1
+
+# Or if you have API key in environment:
+# 0 7 * * 1-5 /path/to/openwebui_tools/warm_cache.sh >> /path/to/openwebui_tools/cron.log 2>&1
+
+# To install crontab:
+# 1. Edit your crontab: crontab -e
+# 2. Add one of the above lines (modified for your paths)
+# 3. Save and exit
+
+# Note: 1-5 means Monday through Friday (market days only)
+# The >> /path/to/openwebui_tools/cron.log 2>&1 part logs both output and errors
+
+
+
+To set up daily cache warming:
+
+First-time setup:
+chmod +x openwebui_tools/warm_cache.sh
+# Save your default tickers
+./openwebui_tools/warm_cache.sh
+Set up the cron job:
+crontab -e
+# Add the line from crontab_example.txt (modified for your paths)
