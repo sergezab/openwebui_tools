@@ -1,74 +1,115 @@
-Open WebUI Tools
+# Open WebUI Tools: Stock Reporter
 
-This repository contains an enhanced version of the Stock Reporter tool for Open WebUI. The Stock Reporter provides comprehensive stock analysis by gathering data from the Finnhub API and compiling detailed reports.
+This repository contains the **Stock Reporter** tool, an enhanced version of the original concept by [christ-offer](https://github.com/christ-offer/open-webui-tools). The Stock Reporter is a comprehensive stock analysis tool that gathers data from the Finnhub API and compiles detailed reports.
 
-Original Idea and Credits: The original concept and implementation were developed by christ-offer.
+## Enhancements
 
-Enhancements
+I have significantly improved the original tool with the following features:
 
-I have made significant modifications to the original tool, including:
-	•	Stock Price Caching:
-	•	Implemented caching of current price data when outside trading hours (9 AM–4 PM EST) or on weekends.
-	•	Cached current price data is used if the request is within 2 hours of the last cache update.
-	•	Added timezone handling using pytz to accurately determine market hours in EST.
-	•	Introduced detailed logging to track when cached prices are being used and the reasons for it.
-	•	Improved Efficiency:
-	•	Reduced unnecessary API calls during non-trading hours.
-	•	Reused recent price data within a 2-hour window.
-	•	Provided clear logging about cache usage.
-	•	Enhanced Security Handling:
-	•	For traditional stocks, the tool continues to display detailed financial analysis with metrics like ROE, P/E ratio, and leverage.
-	•	For ETFs, money market funds, and other non-traditional securities (e.g., GLD and VUSXX), it now displays an appropriate message:
-“Note: Traditional financial metrics are not applicable for [name] as it appears to be an ETF, money market fund, or other non-traditional security. Please refer to the fund’s prospectus and other fund-specific metrics for a more appropriate analysis.”
-	•	Error Handling Improvements:
-	•	Fixed the float division by zero error in the Current Price Position calculation by ensuring a non-zero denominator.
-	•	Handled NoneType comparison errors by properly managing None values in metrics, ensuring all comparisons are done with numeric values.
-	•	Implemented comprehensive error handling to ensure the tool works reliably with all types of tickers, including:
-	•	Returning neutral sentiment instead of failing during sentiment analysis.
-	•	Logging warnings instead of errors and continuing processing remaining news items.
-	•	Starting with a valid default data structure and handling each component independently.
-	•	Continuing if some parts fail and returning valid data even on critical errors.
-	•	Providing default values for all data types and graceful degradation of functionality.
-	•	Logging Improvements:
-	•	Added detailed logs for debugging.
-	•	Provided clear distinctions between warnings and errors.
-	•	Included progress tracking for each component.
-	•	Logged cache hit/miss events.
-	•	Cache Warming System:
-	•	Created a complete cache warming system that pre-caches stock data daily.
-	•	Introduced a Cache Warmer Script (stock_cache_warmer.py) that pre-caches data for multiple tickers in efficient chunks (5 tickers at a time), includes detailed logging in stock_cache_warmer.log, and supports multiple ways to provide tickers:
-	•	Command line arguments.
-	•	Text file (one ticker per line).
-	•	Saved default tickers.
-	•	Handled API rate limiting with delays between chunks and saved progress in case of errors.
-	•	Provided a Shell Script (warm_cache.sh) to make the cache warmer executable and offered examples of different ways to run the warmer:
-	•	Direct ticker list.
-	•	Save and use default tickers.
-	•	Read tickers from a file.
-	•	Used environment variables for the API key.
-	•	Included a Crontab Setup (crontab_example.txt) to run the cache warmer at 7:00 AM before market opens, only on market days (Monday–Friday), and logged output and errors to cron.log.
+- **Caching**: Implemented stock price caching to:
+  - Store current price data when outside trading hours (9 AM–4 PM EST) or on weekends.
+  - Cache current price data when the request is within 2 hours of the last cache update.
+  - Added timezone handling using `pytz` to accurately determine market hours in EST.
+  - Detailed logging to track when cached prices are used and why.
 
-Usage
+  These improvements enhance efficiency by reducing unnecessary API calls during non-trading hours and reusing recent price data within a 2-hour window.
 
-To use this tool, follow these steps:
-	1.	Install the finnhub-python Package:
-Ensure that the finnhub-python package is installed. You can install it using pip:
+- **Logging**: Added detailed logging to monitor:
+  - Cache usage and reasons for using cached data.
+  - Progress tracking for each component.
+  - Clear distinction between warnings and errors.
 
-pip install finnhub-python
+- **Error Handling**: Enhanced error handling to ensure the tool works reliably with all types of tickers:
+  - Returns neutral sentiment instead of failing during sentiment analysis.
+  - Logs warnings instead of errors and continues processing remaining news items.
+  - Starts with a valid default data structure and handles each component independently.
+  - Provides default values for all data types, ensuring graceful degradation of functionality.
 
-If you are running Open WebUI through Docker, you can install it using the following command:
+- **Multiple Ticker Support**: Added support for multiple tickers in a single query, allowing users to analyze several stocks simultaneously.
 
-docker exec -it open-webui bash -c "pip install finnhub-python"
+- **Improved Security Handling**: The tool now better handles different types of securities:
+  - For traditional stocks, it provides detailed financial analysis with metrics like ROE, P/E ratio, and leverage.
+  - For ETFs, money market funds, and other non-traditional securities, it displays an appropriate message indicating that traditional financial metrics are not applicable.
 
+- **Bug Fixes**: Resolved issues in the stock reporter script:
+  - Fixed the float division by zero error in the Current Price Position calculation.
+  - Properly handled `None` values in metrics to prevent `NoneType` comparison errors.
 
-	2.	Provide the Finnhub API Key:
-Set up your Finnhub API key through the Open WebUI interface:
-	•	Navigate to the “Workspace” tab in your Open WebUI instance.
-	•	Click on the “Tools” section.
-	•	Select the Stock Reporter tool.
-	•	In the “Valves” section, enter your Finnhub API key.
-	3.	Integrate the Tool into Open WebUI:
-Follow the manual installation process as outlined in the Open WebUI documentation:
-	•	Navigate to the “Workspace” tab in your Open WebUI instance.
-	•	Click on the “Tools” section.
-	•	Click the “+” button to add a new tool.
+## Installation
+
+The Stock Reporter is written in Python and can be easily integrated into your own WebUI.
+
+1. **Install the `finnhub-python` package**:
+
+   ```bash
+   pip install finnhub-python
+   ```
+
+   If you are running OpenWebUI through Docker, install it using the following command:
+
+   ```bash
+   docker exec -it owui bash -c "pip install finnhub-python"
+   ```
+
+2. **Set up the Finnhub API key**:
+
+   - Provide your Finnhub API key in the Valves section of your WebUI settings.
+   - You can also set up the Finnhub API key through the OpenWebUI interface.
+
+## Usage
+
+To use the Stock Reporter tool:
+
+1. **Ensure the Finnhub API key is configured** as described in the installation steps.
+
+2. **Run the tool** through your WebUI, specifying the ticker(s) you wish to analyze. The tool supports multiple tickers in a single query, separated by commas (e.g., `AAPL, GOOGL, MSFT`).
+
+3. **View the generated report**, which will include comprehensive stock analysis, financial metrics, and recent news sentiment analysis.
+
+## Cache Warming System
+
+I have implemented a complete cache warming system that pre-caches your stock data daily:
+
+- **Cache Warmer Script (`stock_cache_warmer.py`)**:
+  - Pre-caches data for multiple tickers in efficient chunks (5 tickers at a time).
+  - Includes detailed logging in `stock_cache_warmer.log`.
+  - Supports multiple ways to provide tickers: command line arguments, text file (one ticker per line), or saved default tickers.
+  - Handles API rate limiting with delays between chunks and saves progress in case of errors.
+
+- **Shell Script (`warm_cache.sh`)**:
+  - Makes the cache warmer executable.
+  - Provides examples of different ways to run the warmer: direct ticker list, save and use default tickers, or read tickers from a file.
+  - Uses an environment variable for the API key.
+
+- **Crontab Setup (`crontab_example.txt`)**:
+  - Runs the cache warmer at 7:00 AM before the market opens.
+  - Only runs on market days (Monday–Friday).
+  - Logs output and errors to `cron.log`.
+
+**To set up daily cache warming**:
+
+1. **First-time setup**:
+
+   ```bash
+   chmod +x openwebui_tools/warm_cache.sh
+   # Save your default tickers
+   ./openwebui_tools/warm_cache.sh
+   ```
+
+2. **Set up the cron job**:
+
+   ```bash
+   crontab -e
+   # Add the line from crontab_example.txt (modified for your paths)
+   ```
+
+This system ensures your stock data is pre-cached each morning before the market opens, making the model's responses much faster since it will use the cached data from that day.
+
+## License
+
+This project is licensed under the MIT License.
+
+---
+
+*Original idea and all credits belong to [christ-offer](https://github.com/christ-offer/open-webui-tools).*
+
