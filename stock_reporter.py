@@ -532,7 +532,7 @@ class Tools:
 
     async def compile_stock_report(
         self,
-        ticker: Union[str, List[str]],
+        ticker: str,
         __user__: dict = {},
         __event_emitter__: Callable[[Any], Awaitable[None]] = None,
     ) -> str:
