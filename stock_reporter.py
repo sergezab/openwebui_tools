@@ -603,322 +603,249 @@ def interpret_current_ratio(ratio: float, industry: str = None) -> str:
         return "No data available"
 
 
-def assess_financial_health(metrics: Dict[str, Any]) -> str:
-    # Get metrics with proper default handling
-    roe = safe_float(metrics.get("roeRfy", 0))
-    current_ratio = safe_float(metrics.get("currentRatioQuarterly", 0))
-    profit_margin = safe_float(metrics.get("netProfitMarginTTM", 0))
+def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> str:
+    try:
+        # Normalize industry string
+        industry = industry.lower() if industry else ""
 
-    # Score different aspects (0 to 2 points each)
-    points = 0
+        # Industry classification
+        industry_type = None
+        if "retail" in industry:
+            industry_type = "retail"
+        elif "technology" in industry:
+            industry_type = "tech"
+        elif "utilities" in industry:
+            industry_type = "utilities"
+        elif "healthcare" in industry or "health" in industry:
+            industry_type = "healthcare"
+        elif "energy" in industry or "oil" in industry or "gas" in industry:
+            industry_type = "energy"
+        elif "financial" in industry or "bank" in industry:
+            industry_type = "financial"
 
-    # Profitability metrics (heavily weighted due to importance)
-    if roe > 20:
-        points += 2
-    elif roe > 10:
-        points += 1
+        # Get metrics safely
+        metrics_data = {
+            "roe": safe_float(metrics.get("roeTTM"), 0),
+            "current_ratio": safe_float(metrics.get("currentRatioQuarterly"), 0),
+            "profit_margin": safe_float(metrics.get("netProfitMarginTTM"), 0),
+            "asset_turnover": safe_float(metrics.get("assetTurnoverTTM"), 0),
+            "debt_equity": safe_float(metrics.get("totalDebt/totalEquityQuarterly"), 0),
+            "interest_coverage": safe_float(metrics.get("netInterestCoverageTTM"), 0),
+            "inventory_turnover": safe_float(metrics.get("inventoryTurnoverTTM"), 0),
+            "operating_margin": safe_float(metrics.get("operatingMarginTTM"), 0),
+        }
 
-    if profit_margin > 20:
-        points += 2
-    elif profit_margin > 10:
-        points += 1
+        # Industry-specific thresholds
+        thresholds = {
+            "retail": {
+                "profit_margin": {"high": 3, "medium": 2},
+                "current_ratio": {"high": 1.2, "medium": 0.8},
+                "inventory_turnover": {"high": 10, "medium": 6},
+                "debt_equity": {"low": 0.5, "medium": 1.0},
+            },
+            "tech": {
+                "profit_margin": {"high": 20, "medium": 15},
+                "current_ratio": {"high": 1.5, "medium": 1.2},
+                "debt_equity": {"low": 0.3, "medium": 0.6},
+            },
+            "utilities": {
+                "profit_margin": {"high": 12, "medium": 8},
+                "current_ratio": {"high": 1.0, "medium": 0.8},
+                "debt_equity": {"low": 1.2, "medium": 1.5},
+                "interest_coverage": {"high": 3, "medium": 2},
+            },
+            "healthcare": {
+                "profit_margin": {"high": 15, "medium": 10},
+                "current_ratio": {"high": 1.5, "medium": 1.2},
+                "debt_equity": {"low": 0.4, "medium": 0.8},
+            },
+            "energy": {
+                "profit_margin": {"high": 10, "medium": 6},
+                "current_ratio": {"high": 1.2, "medium": 1.0},
+                "debt_equity": {"low": 0.6, "medium": 1.0},
+            },
+            "financial": {
+                "roe": {"high": 15, "medium": 10},
+                "debt_equity": {"low": 3.0, "medium": 4.0},  # Different for financials
+            },
+            "default": {
+                "profit_margin": {"high": 15, "medium": 10},
+                "current_ratio": {"high": 1.5, "medium": 1.2},
+                "debt_equity": {"low": 0.5, "medium": 1.0},
+            },
+        }
 
-    # Liquidity metric (important but shouldn't override strong profitability)
-    if current_ratio > 1.5:
-        points += 2
-    elif current_ratio > 1.0:
-        points += 1
+        # Get appropriate thresholds
+        industry_thresholds = thresholds.get(industry_type, thresholds["default"])
 
-    # Convert points to assessment
-    # Max points = 6
-    if points >= 5:
-        return "strong"
-    elif points >= 3:
-        return "moderate"
-    return "weak"
+        points = 0
+        max_points = 0
+
+        # Profit Margin Assessment
+        if "profit_margin" in industry_thresholds:
+            max_points += 2
+            if (
+                metrics_data["profit_margin"]
+                > industry_thresholds["profit_margin"]["high"]
+            ):
+                points += 2
+            elif (
+                metrics_data["profit_margin"]
+                > industry_thresholds["profit_margin"]["medium"]
+            ):
+                points += 1
+
+        # ROE Assessment (important for all industries)
+        max_points += 2
+        roe_high = industry_thresholds.get("roe", {"high": 20, "medium": 15})["high"]
+        roe_medium = industry_thresholds.get("roe", {"high": 20, "medium": 15})[
+            "medium"
+        ]
+        if metrics_data["roe"] > roe_high:
+            points += 2
+        elif metrics_data["roe"] > roe_medium:
+            points += 1
+
+        # Liquidity Assessment
+        if "current_ratio" in industry_thresholds:
+            max_points += 1
+            if (
+                metrics_data["current_ratio"]
+                > industry_thresholds["current_ratio"]["high"]
+            ):
+                points += 1
+
+        # Solvency Assessment
+        if "debt_equity" in industry_thresholds:
+            max_points += 2
+            if metrics_data["debt_equity"] < industry_thresholds["debt_equity"]["low"]:
+                points += 2
+            elif (
+                metrics_data["debt_equity"]
+                < industry_thresholds["debt_equity"]["medium"]
+            ):
+                points += 1
+
+        # Interest Coverage (especially important for utilities and highly leveraged industries)
+        interest_coverage_thresholds = industry_thresholds.get(
+            "interest_coverage", {"high": 50, "medium": 20}
+        )
+        max_points += 2
+        if metrics_data["interest_coverage"] > interest_coverage_thresholds["high"]:
+            points += 2
+        elif metrics_data["interest_coverage"] > interest_coverage_thresholds["medium"]:
+            points += 1
+
+        # Industry-specific metrics
+        if industry_type == "retail" and "inventory_turnover" in industry_thresholds:
+            max_points += 1
+            if (
+                metrics_data["inventory_turnover"]
+                > industry_thresholds["inventory_turnover"]["high"]
+            ):
+                points += 1
+
+        # Calculate final score
+        score_percentage = (points / max_points) * 100 if max_points > 0 else 0
+
+        # Return assessment
+        score_result = "weak"
+        if score_percentage >= 70:
+            score_result = "strong"
+        elif score_percentage >= 40:
+            score_result = "moderate"
+       
+        return f"{score_result} {round(score_percentage)}% - {industry}"
+
+    except Exception as e:
+        logger.error(f"Error in assess_financial_health: {str(e)}")
+        return "moderate"  # Default to moderate if calculation fails
 
 
 def _compile_report(data: Dict[str, Any]) -> str:
     """
-    Compile gathered data into a comprehensive structured report.
+    Compile gathered data into a concise but comprehensive report.
     """
     try:
         profile = data["basic_info"]["profile"]
         financials = data["basic_info"]["basic_financials"]
         metrics = financials.get("metric", {})
-        peers = data["basic_info"]["peers"]
         price_data = data["current_price"]
 
-        # Safe number formatting
         def format_with_suffix(num):
+            if num is None or num == 0:
+                return "N/A"
             if num >= 1_000_000:
-                return f"{num/1_000_000:,.2f}B"
+                return f"{num/1_000_000:.2f}B"
             elif num >= 1_000:
-                return f"{num/1_000:,.2f}M"
-            return f"{num:,.2f}"
+                return f"{num/1_000:.2f}M"
+            return f"{num:.2f}"
 
-        # Growth metrics interpretation
-        def interpret_growth(value):
-            if value is None:
-                return "No data"
-            try:
-                value = float(value)
-                if value > 15:
-                    return "Strong"
-                elif value > 5:
-                    return "Moderate"
-                elif value > 0:
-                    return "Slow"
-                else:
-                    return "Negative"
-            except (TypeError, ValueError):
-                return "No data"
-
-        # Handle cases where profile might not have all fields
-        ticker = profile.get("ticker", "Unknown")
-        name = profile.get("name", ticker)
-
-        # Safe conversions for financial metrics
-        roe = safe_float(metrics.get("roeRfy"))
-        profit_margin = safe_float(metrics.get("netProfitMarginTTM"))
-        pe_ratio = safe_float(metrics.get("peBasicExclExtraTTM"))
-        current_ratio = safe_float(metrics.get("currentRatioQuarterly"))
-        industry = profile.get("finnhubIndustry", "N/A").lower()
-        current_ratio_interpretation = interpret_current_ratio(current_ratio, industry)
-
-        # Calculate financial health
-        financial_health = assess_financial_health(metrics)
-
-        # Build valuation assessment
-        valuation = (
-            "high" if pe_ratio > 25 else "moderate" if 15 <= pe_ratio <= 25 else "low"
+        fin_health_score = assess_financial_health(
+            metrics, profile.get("finnhubIndustry", "")
         )
 
-        overall_analysis = f"{name} shows {financial_health} financial health with {valuation} valuation metrics. "
+        # Build report with key metrics and insights
+        report = f"""Stock Analysis: {profile.get('name')} ({profile.get('ticker')})
 
-        # Add strength factors safely
-        strength_factors = []
-        if roe > 15:
-            strength_factors.append(
-                f"excellent return on equity of {safe_format_number(roe)}%"
-            )
-        if profit_margin > 20:
-            strength_factors.append(
-                f"strong profit margin of {safe_format_number(profit_margin)}%"
-            )
+Company Overview:
+• {profile.get('finnhubIndustry', 'N/A')} | Market Cap: ${format_with_suffix(profile.get('marketCapitalization', 0) * 1_000_000)} | Country: {profile.get('country', 'N/A')}
+• Current Price: ${safe_format_number(price_data['current_price'])} ({safe_format_number(price_data['change'])}%) | YTD: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
+• 52W Range: ${safe_format_number(metrics.get('52WeekLow'))} - ${safe_format_number(metrics.get('52WeekHigh'))} | Beta: {safe_format_number(metrics.get('beta'))}
 
-        if strength_factors:
-            overall_analysis += (
-                f"The company demonstrates {' and '.join(strength_factors)}. "
-            )
+Key Performance Indicators:
+• Growth (5Y): Revenue {safe_format_number(metrics.get('revenueGrowth5Y'))}% | EPS {safe_format_number(metrics.get('epsGrowth5Y'))}%
+• Margins: Gross {safe_format_number(metrics.get('grossMarginTTM'))}% | Operating {safe_format_number(metrics.get('operatingMarginTTM'))}% | Net {safe_format_number(metrics.get('netProfitMarginTTM'))}%
+• Returns: ROE {safe_format_number(metrics.get('roeTTM'))}% | ROA {safe_format_number(metrics.get('roaTTM'))}%
 
-        # Add comprehensive financial health assessment
-        health_factors = []
+Financial Health:
+• Liquidity: Current Ratio {safe_format_number(metrics.get('currentRatioQuarterly'))} | Quick Ratio {safe_format_number(metrics.get('quickRatioQuarterly'))}
+• Leverage: Debt/Equity {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))} | Interest Coverage {safe_format_number(metrics.get('netInterestCoverageTTM'))}x
+• Per Share: EPS ${safe_format_number(metrics.get('epsTTM'))} | Book Value ${safe_format_number(metrics.get('bookValuePerShareQuarterly'))}
 
-        # Profitability Assessment
-        roe = safe_float(metrics.get("roeTTM", 0))
-        if roe > 15:
-            health_factors.append(
-                f"strong profitability with {safe_format_number(roe)}% return on equity"
-            )
+Valuation:
+• Multiples: P/E {safe_format_number(metrics.get('peTTM'))} | P/B {safe_format_number(metrics.get('pbQuarterly'))} | P/S {safe_format_number(metrics.get('psTTM'))}
+• Dividend Yield: {safe_format_number(metrics.get('dividendYieldIndicatedAnnual'))}% | Payout Ratio: {safe_format_number(metrics.get('payoutRatioTTM'))}%
 
-        # Growth Assessment
-        rev_growth = safe_float(metrics.get("revenueGrowth5Y", 0))
-        if rev_growth > 5:
-            health_factors.append(
-                f"solid 5-year revenue growth of {safe_format_number(rev_growth)}%"
-            )
+Summary Analysis:
+• Health Score: {fin_health_score}
+• Key Strengths: {', '.join([s for s in [
+    'High Growth' if safe_float(metrics.get('revenueGrowth5Y', 0)) > 10 else None,
+    'Strong Margins' if safe_float(metrics.get('netProfitMarginTTM', 0)) > 15 else None,
+    'Solid Returns' if safe_float(metrics.get('roeTTM', 0)) > 15 else None,
+    'Low Leverage' if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) < 0.5 else None
+    ] if s is not None]) or 'None identified'}
+• Key Risks: {', '.join([r for r in [
+    'Negative Growth' if safe_float(metrics.get('revenueGrowth5Y', 0)) < 0 else None,
+    'Low Margins' if safe_float(metrics.get('netProfitMarginTTM', 0)) < 5 else None,
+    'High Leverage' if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) > 2 else None,
+    'High Beta' if safe_float(metrics.get('beta', 0)) > 2 else None
+    ] if r is not None]) or 'None identified'}
 
-        # Efficiency Assessment
-        interest_coverage = safe_float(metrics.get("netInterestCoverageTTM", 0))
-        if interest_coverage > 5:
-            health_factors.append(
-                f"strong interest coverage ratio of {safe_format_number(interest_coverage)}x"
-            )
+Recent News Sentiment:"""
 
-        # Liquidity Assessment
-        quick_ratio = safe_float(metrics.get("quickRatioQuarterly", 0))
-        current_ratio = safe_float(metrics.get("currentRatioQuarterly", 0))
-        if quick_ratio > 1:
-            health_factors.append("excellent liquidity position")
-        elif quick_ratio > 0.8:
-            health_factors.append("adequate liquidity position")
-
-        # Add valuation assessment
-        peg_ratio_assessment = ""
-        pe_ratio = safe_float(metrics.get("peTTM", 0))
-        peg_ratio = (
-            pe_ratio / safe_float(metrics.get("epsGrowth5Y", 1))
-            if safe_float(metrics.get("epsGrowth5Y", 0)) > 0
-            else None
+        # Add sentiment analysis summary
+        positive_count = sum(
+            1 for item in data["sentiments"] if item["sentiment"] == "Positive"
         )
+        negative_count = sum(
+            1 for item in data["sentiments"] if item["sentiment"] == "Negative"
+        )
+        total_count = len(data["sentiments"])
 
-        if peg_ratio:
-            peg_ratio_assessment += f"\nValuation Analysis: PEG ratio of {safe_format_number(peg_ratio)} suggests the stock is "
-            if peg_ratio < 1:
-                peg_ratio_assessment += (
-                    "potentially undervalued relative to its growth rate. "
-                )
-            elif peg_ratio < 1.5:
-                peg_ratio_assessment += "fairly valued relative to its growth rate. "
-            else:
-                peg_ratio_assessment += (
-                    "potentially overvalued relative to its growth rate. "
-                )
+        if total_count > 0:
+            sentiment_ratio = positive_count / total_count
+            overall_sentiment = (
+                "Bullish"
+                if sentiment_ratio > 0.6
+                else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
+            )
+            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
 
-        report = f"""
-        Comprehensive Stock Analysis Report for {name} ({ticker})
+            # Add all recent news
+            for item in data["sentiments"]:
+                report += f"\n• {item['title']} ({item['sentiment']})"
 
-        Basic Information:
-        Industry: {profile.get('finnhubIndustry', 'N/A')}
-        Market Cap: ${format_with_suffix(profile.get('marketCapitalization', 0) * 1_000_000)}
-        Share Outstanding: {format_with_suffix(profile.get('shareOutstanding', 0) * 1_000_000)} shares
-        Country: {profile.get('country', 'N/A')}
-        Exchange: {profile.get('exchange', 'N/A')}
-        IPO Date: {profile.get('ipo', 'N/A')}
-
-        Current Trading Information:
-        Current Price: ${safe_format_number(price_data['current_price'])}
-        Daily Change: {safe_format_number(price_data['change'])}% (${safe_format_number(price_data['change_amount'])})
-        Day's Range: ${safe_format_number(price_data['low'])} - ${safe_format_number(price_data['high'])}
-        Open: ${safe_format_number(price_data['open'])}
-        Previous Close: ${safe_format_number(price_data['previous_close'])}
-        YTD Return: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
-
-        Growth Metrics (5-Year):
-        Revenue Growth: {safe_format_number(metrics.get('revenueGrowth5Y'))}% - {interpret_growth(metrics.get('revenueGrowth5Y', 0))}
-        EPS Growth: {safe_format_number(metrics.get('epsGrowth5Y'))}% - {interpret_growth(metrics.get('epsGrowth5Y', 0))}
-        EBITDA CAGR: {safe_format_number(metrics.get('ebitdaCagr5Y'))}% - {interpret_growth(metrics.get('ebitdaCagr5Y', 0))}
-        Free Cash Flow CAGR: {safe_format_number(metrics.get('focfCagr5Y'))}% - {interpret_growth(metrics.get('focfCagr5Y', 0))}
-
-        Profitability Metrics (TTM):
-        Gross Margin: {safe_format_number(metrics.get('grossMarginTTM'))}%
-        Operating Margin: {safe_format_number(metrics.get('operatingMarginTTM'))}%
-        Net Profit Margin: {safe_format_number(metrics.get('netProfitMarginTTM'))}%
-        ROE: {safe_format_number(metrics.get('roeTTM'))}%
-        ROA: {safe_format_number(metrics.get('roaTTM'))}%
-        ROI: {safe_format_number(metrics.get('roiTTM'))}%
-
-        Efficiency Metrics:
-        Asset Turnover (TTM): {safe_format_number(metrics.get('assetTurnoverTTM'))}x
-        Inventory Turnover (TTM): {safe_format_number(metrics.get('inventoryTurnoverTTM'))}x
-        Receivables Turnover (TTM): {safe_format_number(metrics.get('receivablesTurnoverTTM'))}x
-        Revenue per Employee (TTM): ${safe_format_number(metrics.get('revenueEmployeeTTM'))}M
-
-        Liquidity and Solvency:
-        Current Ratio: {safe_format_number(metrics.get('currentRatioQuarterly'))}
-        Quick Ratio: {safe_format_number(metrics.get('quickRatioQuarterly'))}
-        Total Debt/Equity (Quarterly): {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))}
-        Long-term Debt/Equity (Quarterly): {safe_format_number(metrics.get('longTermDebt/equityQuarterly'))}
-        Interest Coverage (TTM): {safe_format_number(metrics.get('netInterestCoverageTTM'))}x
-
-        Valuation Metrics:
-        P/E (TTM): {safe_format_number(metrics.get('peTTM'))}
-        P/B: {safe_format_number(metrics.get('pbQuarterly'))}
-        P/S (TTM): {safe_format_number(metrics.get('psTTM'))}
-        EV/EBITDA (TTM): {safe_format_number(metrics.get('currentEv/freeCashFlowTTM'))}
-        PEG Ratio (5Y Growth): {
-            safe_format_number(
-                safe_float(metrics.get('peTTM')) / safe_float(metrics.get('epsGrowth5Y'), 1)
-            ) if safe_float(metrics.get('epsGrowth5Y')) > 0 else 'N/A'
-        }
-
-        Dividend Analysis:
-        Dividend Yield (TTM): {safe_format_number(metrics.get('currentDividendYieldTTM'))}%
-        Dividend Growth Rate (5Y): {safe_format_number(metrics.get('dividendGrowthRate5Y'))}%
-        Payout Ratio (TTM): {safe_format_number(metrics.get('payoutRatioTTM'))}%
-
-        Risk Metrics:
-        Beta (vs S&P 500): {safe_format_number(metrics.get('beta'))}
-        52-Week Range: ${safe_format_number(metrics.get('52WeekLow'))} - ${safe_format_number(metrics.get('52WeekHigh'))}
-        3-Month Average Volume: {format_with_suffix(metrics.get('3MonthAverageTradingVolume', 0))}
-        Price vs S&P 500 (YTD): {safe_format_number(metrics.get('priceRelativeToS&P500Ytd'))}%
-
-        Per Share Metrics (TTM):
-        EPS: ${safe_format_number(metrics.get('epsTTM'))}
-        Book Value: ${safe_format_number(metrics.get('bookValuePerShareQuarterly'))}
-        Tangible Book Value: ${safe_format_number(metrics.get('tangibleBookValuePerShareQuarterly'))}
-        Cash Flow: ${safe_format_number(metrics.get('cashFlowPerShareTTM'))}
-        Revenue: ${safe_format_number(metrics.get('revenuePerShareTTM'))}
-        
-        Key Financial Metrics:
-        52 Week High: ${safe_format_number(metrics.get('52WeekHigh'))}
-        52 Week Low: ${safe_format_number(metrics.get('52WeekLow'))}
-        P/E Ratio: {safe_format_number(metrics.get('peBasicExclExtraTTM'))}
-        EPS (TTM): ${safe_format_number(metrics.get('epsBasicExclExtraItemsTTM'))}
-        Return on Equity: {safe_format_number(metrics.get('roeRfy'))}%
-        Debt to Equity: {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))}
-
-        Current Ratio: {safe_format_number(metrics.get('currentRatioQuarterly'))}
-        Dividend Yield: {safe_format_number(metrics.get('dividendYieldIndicatedAnnual'))}%
-
-        Key Peer Companies: {', '.join(peers[:5]) if peers else 'N/A'}
-
-        Financial Health Assessment:
-        {health_factors[0] if health_factors else 'N/A'}
-        {peg_ratio_assessment if peg_ratio_assessment else 'N/A'}
-
-        Detailed Financial Analysis:
-
-        1. Valuation Metrics:
-        P/E Ratio: {metrics.get('peBasicExclExtraTTM', 'N/A')}
-        - Interpretation: {'High (may be overvalued)' if safe_compare(metrics.get('peBasicExclExtraTTM'), 25) 
-            else 'Moderate' if safe_compare(metrics.get('peBasicExclExtraTTM'), 15, 'ge') and safe_compare(metrics.get('peBasicExclExtraTTM'), 25, 'le') 
-            else 'Low (may be undervalued)'}
-        P/B Ratio: {metrics.get('pbQuarterly', 'N/A')}
-        - Interpretation: {'High' if safe_compare(metrics.get('pbQuarterly'), 3) 
-            else 'Moderate' if safe_compare(metrics.get('pbQuarterly'), 1, 'ge') and safe_compare(metrics.get('pbQuarterly'), 3, 'le') 
-            else 'Low'}
-
-        2. Profitability Metrics:
-        Return on Equity: {metrics.get('roeRfy', 'N/A')}%
-        - Interpretation: {'Excellent' if float(metrics.get('roeRfy', 0) or 0) > 20 else 'Good' if 15 <= float(metrics.get('roeRfy', 0) or 0) <= 20 else 'Average' if 10 <= float(metrics.get('roeRfy', 0) or 0) < 15 else 'Poor'}
-
-        Net Profit Margin: {metrics.get('netProfitMarginTTM', 'N/A')}%
-        - Interpretation: {'Excellent' if float(metrics.get('netProfitMarginTTM', 0) or 0) > 20 else 'Good' if 10 <= float(metrics.get('netProfitMarginTTM', 0) or 0) <= 20 else 'Average' if 5 <= float(metrics.get('netProfitMarginTTM', 0) or 0) < 10 else 'Poor'}
-
-        3. Liquidity and Solvency:
-        Current Ratio: {metrics.get('currentRatioQuarterly', 'N/A')}
-        - Interpretation: {current_ratio_interpretation}
-        {
-            '- Note: Tech companies often maintain lower current ratios due to reliable cash flows and strong market positions.' 
-            if 'technology' in industry else ''
-        }
-
-        Debt-to-Equity Ratio: {metrics.get('totalDebt/totalEquityQuarterly', 'N/A')}
-        - Interpretation: {'Low leverage' if float(metrics.get('totalDebt/totalEquityQuarterly', 0) or 0) < 0.5 else 'Moderate leverage' if 0.5 <= float(metrics.get('totalDebt/totalEquityQuarterly', 0) or 0) <= 1 else 'High leverage'}
-
-        4. Dividend Analysis:
-        Dividend Yield: {metrics.get('dividendYieldIndicatedAnnual', 'N/A')}%
-        - Interpretation: {'High yield' if float(metrics.get('dividendYieldIndicatedAnnual', 0) or 0) > 4 else 'Moderate yield' if 2 <= float(metrics.get('dividendYieldIndicatedAnnual', 0) or 0) <= 4 else 'Low yield'}
-
-        5. Market Performance:
-        52-Week Range: ${metrics.get('52WeekLow', 'N/A')} - ${metrics.get('52WeekHigh', 'N/A')}
-        Current Price Position: {((price_data['current_price'] - metrics.get('52WeekLow', price_data['current_price'])) / max(0.0001, metrics.get('52WeekHigh', price_data['current_price']) - metrics.get('52WeekLow', price_data['current_price'])) * 100):.2f}% of 52-Week Range
-
-        Beta: {metrics.get('beta', 'N/A')}
-        - Interpretation: {'More volatile than market' if metrics.get('beta', 1) > 1 else 'Less volatile than market' if metrics.get('beta', 1) < 1 else 'Same volatility as market'}
-
-        Overall Analysis:
-        {
-            f"{overall_analysis}"
-            if any(metrics.get(key) is not None for key in ['roeRfy', 'currentRatioQuarterly', 'peBasicExclExtraTTM', 'netProfitMarginTTM', 'totalDebtToEquityQuarterly'])
-            else f"Note: Traditional financial metrics are not applicable for {name} as it appears to be an ETF, money market fund, or other non-traditional security. Please refer to the fund's prospectus and other fund-specific metrics for a more appropriate analysis."
-        }
-
-
-        Recent News and Sentiment Analysis:
-        """
-
-        for item in data["sentiments"]:
-            report += f"""
-        Title: {item['title']}
-        URL: {item['url']}
-        Sentiment Analysis: {item['sentiment']} (Confidence: {item['confidence']:.2f})
-
-        """
-
-        # report += dict_to_markdown(metrics)
         return report
     except Exception as e:
         import traceback
