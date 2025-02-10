@@ -530,6 +530,20 @@ def safe_format_market_cap(value):
     except (ValueError, TypeError):
         return "N/A"
 
+def dict_to_markdown(d: Dict[str, Any], indent: int = 0) -> str:
+    """Convert a dictionary to markdown format for debugging"""
+    markdown = "\n\n### Raw Metrics Data (Debug Output):\n"
+    markdown += "| Metric | Value |\n"
+    markdown += "|--------|-------|\n"
+    
+    # Sort keys for consistent output
+    for key in sorted(d.keys()):
+        value = d.get(key)
+        # Format None values as 'null' for clarity
+        value_str = 'null' if value is None else str(value)
+        markdown += f"| {key} | {value_str} |\n"
+        
+    return markdown
 
 def interpret_current_ratio(ratio: float, industry: str = None) -> str:
     """
@@ -608,6 +622,25 @@ def _compile_report(data: Dict[str, Any]) -> str:
         peers = data["basic_info"]["peers"]
         price_data = data["current_price"]
 
+        # Safe number formatting
+        def format_with_suffix(num):
+            if num >= 1_000_000:
+                return f"{num/1_000_000:,.2f}B"
+            elif num >= 1_000:
+                return f"{num/1_000:,.2f}M"
+            return f"{num:,.2f}"
+
+        # Growth metrics interpretation
+        def interpret_growth(value):
+            if value > 15:
+                return "Strong"
+            elif value > 5:
+                return "Moderate"
+            elif value > 0:
+                return "Slow"
+            else:
+                return "Negative"
+
         # Handle cases where profile might not have all fields
         ticker = profile.get("ticker", "Unknown")
         name = profile.get("name", ticker)
@@ -619,6 +652,12 @@ def _compile_report(data: Dict[str, Any]) -> str:
         current_ratio = safe_float(metrics.get("currentRatioQuarterly"))
         industry = profile.get("finnhubIndustry", "N/A").lower()
         current_ratio_interpretation = interpret_current_ratio(current_ratio, industry)
+        
+        total_debt = metrics.get("totalDebt", 0)
+        total_equity = metrics.get("totalEquity", 0)
+        debt_to_equity = "N/A"
+        if total_equity != 0:
+            debt_to_equity = total_debt / total_equity
 
         # Calculate financial health
         financial_health = assess_financial_health(metrics)
@@ -646,13 +685,54 @@ def _compile_report(data: Dict[str, Any]) -> str:
                 f"The company demonstrates {' and '.join(strength_factors)}. "
             )
 
+        # Add comprehensive financial health assessment
+        health_factors = []
+        
+        # Profitability Assessment
+        roe = metrics.get('roeTTM', 0)
+        if roe > 15:
+            health_factors.append(f"strong profitability with {safe_format_number(roe)}% return on equity")
+        
+        # Growth Assessment
+        rev_growth = metrics.get('revenueGrowth5Y', 0)
+        if rev_growth > 5:
+            health_factors.append(f"solid 5-year revenue growth of {safe_format_number(rev_growth)}%")
+        
+        # Efficiency Assessment
+        interest_coverage = metrics.get('netInterestCoverageTTM', 0)
+        if interest_coverage > 5:
+            health_factors.append(f"strong interest coverage ratio of {safe_format_number(interest_coverage)}x")
+        
+        # Liquidity Assessment
+        quick_ratio = metrics.get('quickRatioQuarterly', 0)
+        current_ratio = metrics.get('currentRatioQuarterly', 0)
+        if quick_ratio > 1:
+            health_factors.append("excellent liquidity position")
+        elif quick_ratio > 0.8:
+            health_factors.append("adequate liquidity position")   
+
+          # Add valuation assessment
+        peg_ratio_assessment = ""
+        pe_ratio = metrics.get('peTTM', 0)
+        peg_ratio = pe_ratio / metrics.get('epsGrowth5Y', 1) if metrics.get('epsGrowth5Y', 0) > 0 else None
+        
+        if peg_ratio:
+            peg_ratio_assessment += f"\nValuation Analysis: PEG ratio of {safe_format_number(peg_ratio)} suggests the stock is "
+            if peg_ratio < 1:
+                peg_ratio_assessment += "potentially undervalued relative to its growth rate. "
+            elif peg_ratio < 1.5:
+                peg_ratio_assessment += "fairly valued relative to its growth rate. "
+            else:
+                peg_ratio_assessment += "potentially overvalued relative to its growth rate. "
+   
+
         report = f"""
         Comprehensive Stock Analysis Report for {name} ({ticker})
 
         Basic Information:
         Industry: {profile.get('finnhubIndustry', 'N/A')}
-        Market Cap: {safe_format_market_cap(profile.get('marketCapitalization', 0))} M USD
-        Share Outstanding: {safe_format_market_cap(profile.get('shareOutstanding', 0))} M
+        Market Cap: ${format_with_suffix(profile.get('marketCapitalization', 0) * 1_000_000)}
+        Share Outstanding: {format_with_suffix(profile.get('shareOutstanding', 0) * 1_000_000)} shares
         Country: {profile.get('country', 'N/A')}
         Exchange: {profile.get('exchange', 'N/A')}
         IPO Date: {profile.get('ipo', 'N/A')}
@@ -663,18 +743,79 @@ def _compile_report(data: Dict[str, Any]) -> str:
         Day's Range: ${safe_format_number(price_data['low'])} - ${safe_format_number(price_data['high'])}
         Open: ${safe_format_number(price_data['open'])}
         Previous Close: ${safe_format_number(price_data['previous_close'])}
+        YTD Return: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
 
+        Growth Metrics (5-Year):
+        Revenue Growth: {safe_format_number(metrics.get('revenueGrowth5Y'))}% - {interpret_growth(metrics.get('revenueGrowth5Y', 0))}
+        EPS Growth: {safe_format_number(metrics.get('epsGrowth5Y'))}% - {interpret_growth(metrics.get('epsGrowth5Y', 0))}
+        EBITDA CAGR: {safe_format_number(metrics.get('ebitdaCagr5Y'))}% - {interpret_growth(metrics.get('ebitdaCagr5Y', 0))}
+        Free Cash Flow CAGR: {safe_format_number(metrics.get('focfCagr5Y'))}% - {interpret_growth(metrics.get('focfCagr5Y', 0))}
+
+        Profitability Metrics (TTM):
+        Gross Margin: {safe_format_number(metrics.get('grossMarginTTM'))}%
+        Operating Margin: {safe_format_number(metrics.get('operatingMarginTTM'))}%
+        Net Profit Margin: {safe_format_number(metrics.get('netProfitMarginTTM'))}%
+        ROE: {safe_format_number(metrics.get('roeTTM'))}%
+        ROA: {safe_format_number(metrics.get('roaTTM'))}%
+        ROI: {safe_format_number(metrics.get('roiTTM'))}%
+
+        Efficiency Metrics:
+        Asset Turnover (TTM): {safe_format_number(metrics.get('assetTurnoverTTM'))}x
+        Inventory Turnover (TTM): {safe_format_number(metrics.get('inventoryTurnoverTTM'))}x
+        Receivables Turnover (TTM): {safe_format_number(metrics.get('receivablesTurnoverTTM'))}x
+        Revenue per Employee (TTM): ${safe_format_number(metrics.get('revenueEmployeeTTM'))}M
+
+        Liquidity and Solvency:
+        Current Ratio: {safe_format_number(metrics.get('currentRatioQuarterly'))}
+        Quick Ratio: {safe_format_number(metrics.get('quickRatioQuarterly'))}
+        Total Debt/Equity (Quarterly): {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))}
+        Long-term Debt/Equity (Quarterly): {safe_format_number(metrics.get('longTermDebt/equityQuarterly'))}
+        Interest Coverage (TTM): {safe_format_number(metrics.get('netInterestCoverageTTM'))}x
+
+        Valuation Metrics:
+        P/E (TTM): {safe_format_number(metrics.get('peTTM'))}
+        P/B: {safe_format_number(metrics.get('pbQuarterly'))}
+        P/S (TTM): {safe_format_number(metrics.get('psTTM'))}
+        EV/EBITDA (TTM): {safe_format_number(metrics.get('currentEv/freeCashFlowTTM'))}
+        PEG Ratio (5Y Growth): {
+            safe_format_number(float(metrics.get('peTTM', 0)) / float(metrics.get('epsGrowth5Y', 1))) 
+            if metrics.get('epsGrowth5Y', 0) > 0 else 'N/A'
+        }
+
+        Dividend Analysis:
+        Dividend Yield (TTM): {safe_format_number(metrics.get('currentDividendYieldTTM'))}%
+        Dividend Growth Rate (5Y): {safe_format_number(metrics.get('dividendGrowthRate5Y'))}%
+        Payout Ratio (TTM): {safe_format_number(metrics.get('payoutRatioTTM'))}%
+
+        Risk Metrics:
+        Beta (vs S&P 500): {safe_format_number(metrics.get('beta'))}
+        52-Week Range: ${safe_format_number(metrics.get('52WeekLow'))} - ${safe_format_number(metrics.get('52WeekHigh'))}
+        3-Month Average Volume: {format_with_suffix(metrics.get('3MonthAverageTradingVolume', 0))}
+        Price vs S&P 500 (YTD): {safe_format_number(metrics.get('priceRelativeToS&P500Ytd'))}%
+
+        Per Share Metrics (TTM):
+        EPS: ${safe_format_number(metrics.get('epsTTM'))}
+        Book Value: ${safe_format_number(metrics.get('bookValuePerShareQuarterly'))}
+        Tangible Book Value: ${safe_format_number(metrics.get('tangibleBookValuePerShareQuarterly'))}
+        Cash Flow: ${safe_format_number(metrics.get('cashFlowPerShareTTM'))}
+        Revenue: ${safe_format_number(metrics.get('revenuePerShareTTM'))}
+        
         Key Financial Metrics:
         52 Week High: ${safe_format_number(metrics.get('52WeekHigh'))}
         52 Week Low: ${safe_format_number(metrics.get('52WeekLow'))}
         P/E Ratio: {safe_format_number(metrics.get('peBasicExclExtraTTM'))}
         EPS (TTM): ${safe_format_number(metrics.get('epsBasicExclExtraItemsTTM'))}
         Return on Equity: {safe_format_number(metrics.get('roeRfy'))}%
-        Debt to Equity: {safe_format_number(metrics.get('totalDebtToEquityQuarterly'))}
+        Debt to Equity: {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))}
+
         Current Ratio: {safe_format_number(metrics.get('currentRatioQuarterly'))}
         Dividend Yield: {safe_format_number(metrics.get('dividendYieldIndicatedAnnual'))}%
 
-        Peer Companies: {', '.join(peers[:5])}
+        Key Peer Companies: {', '.join(peers[:5]) if peers else 'N/A'}
+
+        Financial Health Assessment:
+        {health_factors[0] if health_factors else 'N/A'}
+        {peg_ratio_assessment if peg_ratio_assessment else 'N/A'}
 
         Detailed Financial Analysis:
 
@@ -700,8 +841,8 @@ def _compile_report(data: Dict[str, Any]) -> str:
             if 'technology' in industry else ''
         }
 
-        Debt-to-Equity Ratio: {metrics.get('totalDebtToEquityQuarterly', 'N/A')}
-        - Interpretation: {'Low leverage' if float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) < 0.5 else 'Moderate leverage' if 0.5 <= float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) <= 1 else 'High leverage'}
+        Debt-to-Equity Ratio: {metrics.get('totalDebt/totalEquityQuarterly', 'N/A')}
+        - Interpretation: {'Low leverage' if float(metrics.get('totalDebt/totalEquityQuarterly', 0) or 0) < 0.5 else 'Moderate leverage' if 0.5 <= float(metrics.get('totalDebt/totalEquityQuarterly', 0) or 0) <= 1 else 'High leverage'}
 
         4. Dividend Analysis:
         Dividend Yield: {metrics.get('dividendYieldIndicatedAnnual', 'N/A')}%
@@ -732,6 +873,8 @@ def _compile_report(data: Dict[str, Any]) -> str:
         Sentiment Analysis: {item['sentiment']} (Confidence: {item['confidence']:.2f})
 
         """
+            
+        report += dict_to_markdown(metrics)
         return report
     except Exception as e:
         logger.error(f"Error compiling report: {str(e)}")
