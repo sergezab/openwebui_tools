@@ -23,6 +23,7 @@ import torch
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
+import traceback
 from typing import (
     Dict,
     Any,
@@ -521,6 +522,24 @@ def safe_float(value, default=0.0):
         return default
 
 
+def safe_compare(value, threshold, comparison="gt"):
+    if value is None:
+        return False
+    try:
+        value = float(value)
+        if comparison == "gt":
+            return value > threshold
+        elif comparison == "lt":
+            return value < threshold
+        elif comparison == "ge":
+            return value >= threshold
+        elif comparison == "le":
+            return value <= threshold
+        return False
+    except (TypeError, ValueError):
+        return False
+
+
 def safe_format_market_cap(value):
     """Safely format market cap with commas"""
     if value is None or value == "N/A":
@@ -530,57 +549,65 @@ def safe_format_market_cap(value):
     except (ValueError, TypeError):
         return "N/A"
 
+
 def dict_to_markdown(d: Dict[str, Any], indent: int = 0) -> str:
     """Convert a dictionary to markdown format for debugging"""
     markdown = "\n\n### Raw Metrics Data (Debug Output):\n"
     markdown += "| Metric | Value |\n"
     markdown += "|--------|-------|\n"
-    
+
     # Sort keys for consistent output
     for key in sorted(d.keys()):
         value = d.get(key)
         # Format None values as 'null' for clarity
-        value_str = 'null' if value is None else str(value)
+        value_str = "null" if value is None else str(value)
         markdown += f"| {key} | {value_str} |\n"
-        
+
     return markdown
+
 
 def interpret_current_ratio(ratio: float, industry: str = None) -> str:
     """
     Interpret current ratio with industry context
     """
-    # Special handling for tech and retail industries which typically run lower ratios
-    is_tech = industry and "technology" in industry.lower()
-    is_retail = industry and "retail" in industry.lower()
+    if ratio is None:
+        return "No data available"
+    try:
+        ratio = float(ratio)
+        # Special handling for tech and retail industries which typically run lower ratios
+        is_tech = industry and "technology" in industry.lower()
+        is_retail = industry and "retail" in industry.lower()
 
-    if is_tech or is_retail:
-        if ratio > 1.5:
-            return "Very Strong (above industry average)"
-        if ratio > 1.2:
-            return "Strong"
-        if ratio > 0.8:
-            return "Adequate (typical for industry)"
-        if ratio > 0.6:
-            return "Below Average"
-        return "Concerning"
-    else:
-        # Traditional thresholds for other industries
-        if ratio > 2.0:
-            return "Very Strong"
-        if ratio > 1.5:
-            return "Strong"
-        if ratio > 1.0:
-            return "Adequate"
-        if ratio > 0.8:
-            return "Below Average"
-        return "Concerning"
+        if is_tech or is_retail:
+            if ratio > 1.5:
+                return "Very Strong (above industry average)"
+            if ratio > 1.2:
+                return "Strong"
+            if ratio > 0.8:
+                return "Adequate (typical for industry)"
+            if ratio > 0.6:
+                return "Below Average"
+            return "Concerning"
+        else:
+            # Traditional thresholds for other industries
+            if ratio > 2.0:
+                return "Very Strong"
+            if ratio > 1.5:
+                return "Strong"
+            if ratio > 1.0:
+                return "Adequate"
+            if ratio > 0.8:
+                return "Below Average"
+            return "Concerning"
+    except (TypeError, ValueError):
+        return "No data available"
 
 
 def assess_financial_health(metrics: Dict[str, Any]) -> str:
     # Get metrics with proper default handling
-    roe = float(metrics.get("roeRfy", 0) or 0)
-    current_ratio = float(metrics.get("currentRatioQuarterly", 0) or 0)
-    profit_margin = float(metrics.get("netProfitMarginTTM", 0) or 0)
+    roe = safe_float(metrics.get("roeRfy", 0))
+    current_ratio = safe_float(metrics.get("currentRatioQuarterly", 0))
+    profit_margin = safe_float(metrics.get("netProfitMarginTTM", 0))
 
     # Score different aspects (0 to 2 points each)
     points = 0
@@ -632,14 +659,20 @@ def _compile_report(data: Dict[str, Any]) -> str:
 
         # Growth metrics interpretation
         def interpret_growth(value):
-            if value > 15:
-                return "Strong"
-            elif value > 5:
-                return "Moderate"
-            elif value > 0:
-                return "Slow"
-            else:
-                return "Negative"
+            if value is None:
+                return "No data"
+            try:
+                value = float(value)
+                if value > 15:
+                    return "Strong"
+                elif value > 5:
+                    return "Moderate"
+                elif value > 0:
+                    return "Slow"
+                else:
+                    return "Negative"
+            except (TypeError, ValueError):
+                return "No data"
 
         # Handle cases where profile might not have all fields
         ticker = profile.get("ticker", "Unknown")
@@ -652,12 +685,6 @@ def _compile_report(data: Dict[str, Any]) -> str:
         current_ratio = safe_float(metrics.get("currentRatioQuarterly"))
         industry = profile.get("finnhubIndustry", "N/A").lower()
         current_ratio_interpretation = interpret_current_ratio(current_ratio, industry)
-        
-        total_debt = metrics.get("totalDebt", 0)
-        total_equity = metrics.get("totalEquity", 0)
-        debt_to_equity = "N/A"
-        if total_equity != 0:
-            debt_to_equity = total_debt / total_equity
 
         # Calculate financial health
         financial_health = assess_financial_health(metrics)
@@ -687,44 +714,57 @@ def _compile_report(data: Dict[str, Any]) -> str:
 
         # Add comprehensive financial health assessment
         health_factors = []
-        
+
         # Profitability Assessment
-        roe = metrics.get('roeTTM', 0)
+        roe = safe_float(metrics.get("roeTTM", 0))
         if roe > 15:
-            health_factors.append(f"strong profitability with {safe_format_number(roe)}% return on equity")
-        
+            health_factors.append(
+                f"strong profitability with {safe_format_number(roe)}% return on equity"
+            )
+
         # Growth Assessment
-        rev_growth = metrics.get('revenueGrowth5Y', 0)
+        rev_growth = safe_float(metrics.get("revenueGrowth5Y", 0))
         if rev_growth > 5:
-            health_factors.append(f"solid 5-year revenue growth of {safe_format_number(rev_growth)}%")
-        
+            health_factors.append(
+                f"solid 5-year revenue growth of {safe_format_number(rev_growth)}%"
+            )
+
         # Efficiency Assessment
-        interest_coverage = metrics.get('netInterestCoverageTTM', 0)
+        interest_coverage = safe_float(metrics.get("netInterestCoverageTTM", 0))
         if interest_coverage > 5:
-            health_factors.append(f"strong interest coverage ratio of {safe_format_number(interest_coverage)}x")
-        
+            health_factors.append(
+                f"strong interest coverage ratio of {safe_format_number(interest_coverage)}x"
+            )
+
         # Liquidity Assessment
-        quick_ratio = metrics.get('quickRatioQuarterly', 0)
-        current_ratio = metrics.get('currentRatioQuarterly', 0)
+        quick_ratio = safe_float(metrics.get("quickRatioQuarterly", 0))
+        current_ratio = safe_float(metrics.get("currentRatioQuarterly", 0))
         if quick_ratio > 1:
             health_factors.append("excellent liquidity position")
         elif quick_ratio > 0.8:
-            health_factors.append("adequate liquidity position")   
+            health_factors.append("adequate liquidity position")
 
-          # Add valuation assessment
+        # Add valuation assessment
         peg_ratio_assessment = ""
-        pe_ratio = metrics.get('peTTM', 0)
-        peg_ratio = pe_ratio / metrics.get('epsGrowth5Y', 1) if metrics.get('epsGrowth5Y', 0) > 0 else None
-        
+        pe_ratio = safe_float(metrics.get("peTTM", 0))
+        peg_ratio = (
+            pe_ratio / safe_float(metrics.get("epsGrowth5Y", 1))
+            if safe_float(metrics.get("epsGrowth5Y", 0)) > 0
+            else None
+        )
+
         if peg_ratio:
             peg_ratio_assessment += f"\nValuation Analysis: PEG ratio of {safe_format_number(peg_ratio)} suggests the stock is "
             if peg_ratio < 1:
-                peg_ratio_assessment += "potentially undervalued relative to its growth rate. "
+                peg_ratio_assessment += (
+                    "potentially undervalued relative to its growth rate. "
+                )
             elif peg_ratio < 1.5:
                 peg_ratio_assessment += "fairly valued relative to its growth rate. "
             else:
-                peg_ratio_assessment += "potentially overvalued relative to its growth rate. "
-   
+                peg_ratio_assessment += (
+                    "potentially overvalued relative to its growth rate. "
+                )
 
         report = f"""
         Comprehensive Stock Analysis Report for {name} ({ticker})
@@ -778,8 +818,9 @@ def _compile_report(data: Dict[str, Any]) -> str:
         P/S (TTM): {safe_format_number(metrics.get('psTTM'))}
         EV/EBITDA (TTM): {safe_format_number(metrics.get('currentEv/freeCashFlowTTM'))}
         PEG Ratio (5Y Growth): {
-            safe_format_number(float(metrics.get('peTTM', 0)) / float(metrics.get('epsGrowth5Y', 1))) 
-            if metrics.get('epsGrowth5Y', 0) > 0 else 'N/A'
+            safe_format_number(
+                safe_float(metrics.get('peTTM')) / safe_float(metrics.get('epsGrowth5Y'), 1)
+            ) if safe_float(metrics.get('epsGrowth5Y')) > 0 else 'N/A'
         }
 
         Dividend Analysis:
@@ -821,10 +862,13 @@ def _compile_report(data: Dict[str, Any]) -> str:
 
         1. Valuation Metrics:
         P/E Ratio: {metrics.get('peBasicExclExtraTTM', 'N/A')}
-        - Interpretation: {'High (may be overvalued)' if float(metrics.get('peBasicExclExtraTTM', 0) or 0) > 25 else 'Moderate' if 15 <= float(metrics.get('peBasicExclExtraTTM', 0) or 0) <= 25 else 'Low (may be undervalued)'}
-
+        - Interpretation: {'High (may be overvalued)' if safe_compare(metrics.get('peBasicExclExtraTTM'), 25) 
+            else 'Moderate' if safe_compare(metrics.get('peBasicExclExtraTTM'), 15, 'ge') and safe_compare(metrics.get('peBasicExclExtraTTM'), 25, 'le') 
+            else 'Low (may be undervalued)'}
         P/B Ratio: {metrics.get('pbQuarterly', 'N/A')}
-        - Interpretation: {'High' if float(metrics.get('pbQuarterly', 0) or 0) > 3 else 'Moderate' if 1 <= float(metrics.get('pbQuarterly', 0) or 0) <= 3 else 'Low'}
+        - Interpretation: {'High' if safe_compare(metrics.get('pbQuarterly'), 3) 
+            else 'Moderate' if safe_compare(metrics.get('pbQuarterly'), 1, 'ge') and safe_compare(metrics.get('pbQuarterly'), 3, 'le') 
+            else 'Low'}
 
         2. Profitability Metrics:
         Return on Equity: {metrics.get('roeRfy', 'N/A')}%
@@ -855,12 +899,12 @@ def _compile_report(data: Dict[str, Any]) -> str:
         Beta: {metrics.get('beta', 'N/A')}
         - Interpretation: {'More volatile than market' if metrics.get('beta', 1) > 1 else 'Less volatile than market' if metrics.get('beta', 1) < 1 else 'Same volatility as market'}
 
-    Overall Analysis:
-    {
-        f"{overall_analysis}"
-        if any(metrics.get(key) is not None for key in ['roeRfy', 'currentRatioQuarterly', 'peBasicExclExtraTTM', 'netProfitMarginTTM', 'totalDebtToEquityQuarterly'])
-        else f"Note: Traditional financial metrics are not applicable for {name} as it appears to be an ETF, money market fund, or other non-traditional security. Please refer to the fund's prospectus and other fund-specific metrics for a more appropriate analysis."
-    }
+        Overall Analysis:
+        {
+            f"{overall_analysis}"
+            if any(metrics.get(key) is not None for key in ['roeRfy', 'currentRatioQuarterly', 'peBasicExclExtraTTM', 'netProfitMarginTTM', 'totalDebtToEquityQuarterly'])
+            else f"Note: Traditional financial metrics are not applicable for {name} as it appears to be an ETF, money market fund, or other non-traditional security. Please refer to the fund's prospectus and other fund-specific metrics for a more appropriate analysis."
+        }
 
 
         Recent News and Sentiment Analysis:
@@ -873,11 +917,19 @@ def _compile_report(data: Dict[str, Any]) -> str:
         Sentiment Analysis: {item['sentiment']} (Confidence: {item['confidence']:.2f})
 
         """
-            
-        report += dict_to_markdown(metrics)
+
+        # report += dict_to_markdown(metrics)
         return report
     except Exception as e:
-        logger.error(f"Error compiling report: {str(e)}")
+        import traceback
+
+        tb = traceback.extract_tb(e.__traceback__)
+        filename, line_no, func_name, text = tb[-1]
+        logger.error(
+            f"Error compiling report at line {line_no} in {func_name}: {str(e)}"
+        )
+        logger.error(f"Line content: {text}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
 
 
@@ -1005,8 +1057,12 @@ class Tools:
             return f"Tickers {tickers}\n\n Combined Report:\n{combined_report}"
 
         except Exception as e:
+            tb = traceback.extract_tb(e.__traceback__)
+            filename, line_no, func_name, text = tb[-1]
             error_msg = (
-                f"Error in compile_stock_report for tickers {ticker_query} : {str(e)}"
+                f"Error in compile_stock_report for tickers {ticker_query} at line {line_no}: {str(e)}\n"
+                f"Line content: {text}"
             )
             logger.error(error_msg)
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             raise Exception(error_msg)
