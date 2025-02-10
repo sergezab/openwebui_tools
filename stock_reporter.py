@@ -2,10 +2,10 @@
 title: Stock Market Helper
 description: A comprehensive stock analysis tool that gathers data from Finnhub API and compiles a detailed report.
 author: Sergii Zabigailo
-author_url: hhttps://github.com/sergezab/
-github: https://github.com/sergezab/openwebui_tools/
+author_url: https://github.com/christ-offer/
+github: https://github.com/christ-offer/open-webui-tools
 funding_url: https://github.com/open-webui
-version: 0.2.1
+version: 0.0.9
 license: MIT
 requirements: finnhub-python,pytz
 """
@@ -521,6 +521,16 @@ def safe_float(value, default=0.0):
         return default
 
 
+def safe_format_market_cap(value):
+    """Safely format market cap with commas"""
+    if value is None or value == "N/A":
+        return "N/A"
+    try:
+        return f"{float(value):,.0f}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 def interpret_current_ratio(ratio: float, industry: str = None) -> str:
     """
     Interpret current ratio with industry context
@@ -640,29 +650,29 @@ def _compile_report(data: Dict[str, Any]) -> str:
         Comprehensive Stock Analysis Report for {name} ({ticker})
 
         Basic Information:
-        Industry: {industry}
-        Market Cap: {profile.get('marketCapitalization', 0):,.0f} M USD
-        Share Outstanding: {profile.get('shareOutstanding', 0):,.0f} M
+        Industry: {profile.get('finnhubIndustry', 'N/A')}
+        Market Cap: {safe_format_market_cap(profile.get('marketCapitalization', 0))} M USD
+        Share Outstanding: {safe_format_market_cap(profile.get('shareOutstanding', 0))} M
         Country: {profile.get('country', 'N/A')}
         Exchange: {profile.get('exchange', 'N/A')}
         IPO Date: {profile.get('ipo', 'N/A')}
 
         Current Trading Information:
-        Current Price: ${price_data['current_price']:.2f}
-        Daily Change: {price_data['change']:.2f}% (${price_data['change_amount']:.2f})
-        Day's Range: ${price_data['low']:.2f} - ${price_data['high']:.2f}
-        Open: ${price_data['open']:.2f}
-        Previous Close: ${price_data['previous_close']:.2f}
+        Current Price: ${safe_format_number(price_data['current_price'])}
+        Daily Change: {safe_format_number(price_data['change'])}% (${safe_format_number(price_data['change_amount'])})
+        Day's Range: ${safe_format_number(price_data['low'])} - ${safe_format_number(price_data['high'])}
+        Open: ${safe_format_number(price_data['open'])}
+        Previous Close: ${safe_format_number(price_data['previous_close'])}
 
         Key Financial Metrics:
-        52 Week High: ${financials['metric'].get('52WeekHigh', 'N/A')}
-        52 Week Low: ${financials['metric'].get('52WeekLow', 'N/A')}
-        P/E Ratio: {financials['metric'].get('peBasicExclExtraTTM', 'N/A')}
-        EPS (TTM): ${financials['metric'].get('epsBasicExclExtraItemsTTM', 'N/A')}
-        Return on Equity: {financials['metric'].get('roeRfy', 'N/A')}%
-        Debt to Equity: {financials['metric'].get('totalDebtToEquityQuarterly', 'N/A')}
-        Current Ratio: {financials['metric'].get('currentRatioQuarterly', 'N/A')}
-        Dividend Yield: {financials['metric'].get('dividendYieldIndicatedAnnual', 'N/A')}%
+        52 Week High: ${safe_format_number(metrics.get('52WeekHigh'))}
+        52 Week Low: ${safe_format_number(metrics.get('52WeekLow'))}
+        P/E Ratio: {safe_format_number(metrics.get('peBasicExclExtraTTM'))}
+        EPS (TTM): ${safe_format_number(metrics.get('epsBasicExclExtraItemsTTM'))}
+        Return on Equity: {safe_format_number(metrics.get('roeRfy'))}%
+        Debt to Equity: {safe_format_number(metrics.get('totalDebtToEquityQuarterly'))}
+        Current Ratio: {safe_format_number(metrics.get('currentRatioQuarterly'))}
+        Dividend Yield: {safe_format_number(metrics.get('dividendYieldIndicatedAnnual'))}%
 
         Peer Companies: {', '.join(peers[:5])}
 
