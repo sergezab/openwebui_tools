@@ -2,10 +2,10 @@
 title: Stock Market Helper
 description: A comprehensive stock analysis tool that gathers data from Finnhub API and compiles a detailed report.
 author: Sergii Zabigailo
-author_url: https://github.com/christ-offer/
-github: https://github.com/christ-offer/open-webui-tools
+author_url: hhttps://github.com/sergezab/
+github: https://github.com/sergezab/openwebui_tools/
 funding_url: https://github.com/open-webui
-version: 0.0.9
+version: 0.2.1
 license: MIT
 requirements: finnhub-python,pytz
 """
@@ -73,9 +73,9 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     result = {
         "profile": {"ticker": ticker},  # Minimal profile with just the ticker
         "basic_financials": {"metric": {}},  # Empty financials
-        "peers": []  # Empty peers list
+        "peers": [],  # Empty peers list
     }
-    
+
     try:
         # Try to get profile
         try:
@@ -83,26 +83,32 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
             if profile:
                 result["profile"] = profile
         except Exception as e:
-            logger.warning(f"Could not fetch profile for {ticker}, using minimal profile: {str(e)}")
-    
+            logger.warning(
+                f"Could not fetch profile for {ticker}, using minimal profile: {str(e)}"
+            )
+
         # Try to get financials
         try:
             basic_financials = client.company_basic_financials(ticker, "all")
             if basic_financials and "metric" in basic_financials:
                 result["basic_financials"] = basic_financials
         except Exception as e:
-            logger.warning(f"Could not fetch financials for {ticker}, using empty financials: {str(e)}")
-    
+            logger.warning(
+                f"Could not fetch financials for {ticker}, using empty financials: {str(e)}"
+            )
+
         # Try to get peers
         try:
             peers = client.company_peers(ticker)
             if peers:
                 result["peers"] = peers
         except Exception as e:
-            logger.warning(f"Could not fetch peers for {ticker}, using empty peers list: {str(e)}")
-    
+            logger.warning(
+                f"Could not fetch peers for {ticker}, using empty peers list: {str(e)}"
+            )
+
         return result
-        
+
     except Exception as e:
         logger.error(f"Critical error in _get_basic_info for {ticker}: {str(e)}")
         return result  # Return default structure even on critical error
@@ -152,7 +158,9 @@ def _get_company_news(client: finnhub.Client, ticker: str) -> List[Dict[str, str
         news_items = news[:10]  # Get the first 10 news items
         return [{"url": item["url"], "title": item["headline"]} for item in news_items]
     except Exception as e:
-        logger.warning(f"Could not fetch news for {ticker}, using empty news list: {str(e)}")
+        logger.warning(
+            f"Could not fetch news for {ticker}, using empty news list: {str(e)}"
+        )
         return []  # Return empty list instead of raising exception
 
 
@@ -214,7 +222,9 @@ async def _async_sentiment_analysis(content: str) -> Dict[str, Union[str, float]
 
         return {"sentiment": sentiment, "confidence": confidence}
     except Exception as e:
-        logger.warning(f"Error in sentiment analysis, using neutral sentiment: {str(e)}")
+        logger.warning(
+            f"Error in sentiment analysis, using neutral sentiment: {str(e)}"
+        )
         return {"sentiment": "Neutral", "confidence": 0.0}
 
 
@@ -254,19 +264,87 @@ def _is_cache_valid(cached_data: Dict[str, Any], data_type: str) -> bool:
         return False
 
 
-def _is_market_hours() -> bool:
-    """Check if current time is within market hours (9:00 AM - 4:00 PM EST)"""
-    est = pytz.timezone('US/Eastern')
+def get_last_trading_day(current_time: datetime) -> datetime:
+    """
+    Get the most recent trading day (excluding weekends and current day before market opens)
+    """
+    est = pytz.timezone("US/Eastern")
+    if not isinstance(current_time, datetime):
+        current_time = datetime.now(est)
+    elif current_time.tzinfo is None:
+        current_time = est.localize(current_time)
+
+    # Start with current day
+    last_trading_day = current_time
+
+    # If it's before market open (9:30 AM), look at previous day
+    market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    if current_time < market_open:
+        last_trading_day = current_time - timedelta(days=1)
+
+    # Keep going back until we find a weekday
+    while last_trading_day.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        last_trading_day = last_trading_day - timedelta(days=1)
+
+    return last_trading_day
+
+
+def is_cache_stale(cache_time: datetime) -> bool:
+    """
+    Check if cached data is stale by comparing with last valid trading day
+    """
+    est = pytz.timezone("US/Eastern")
+    if cache_time.tzinfo is None:
+        cache_time = est.localize(cache_time)
+
+    current_time = datetime.now(est)
+    last_trading = get_last_trading_day(current_time)
+
+    # Convert to dates for comparison
+    cache_date = cache_time.date()
+    last_trading_date = last_trading.date()
+
+    # If cache is from before the last trading day, it's stale
+    if cache_date < last_trading_date:
+        return True
+
+    # If cache is from last trading day, check if it was after market close (4 PM)
+    if cache_date == last_trading_date:
+        market_close = cache_time.replace(hour=16, minute=0, second=0, microsecond=0)
+        return cache_time < market_close
+
+    return False
+
+
+def _is_market_hours() -> Tuple[bool, str]:
+    """
+    Check if current time is within market hours and return explanation
+    Returns: (is_open: bool, reason: str)
+    """
+    est = pytz.timezone("US/Eastern")
     now = datetime.now(est)
-    
+
     # Check if it's a weekday
     if now.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-        return False
-        
-    market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        return False, "Market is closed (Weekend)"
+
+    # Market hours: 9:30 AM - 4:00 PM EST
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    
-    return market_open <= now <= market_close
+
+    if now < market_open:
+        return (
+            False,
+            f"Market is not open yet (Opens at 9:30 AM EST, current time: {now.strftime('%I:%M %p')} EST)",
+        )
+    elif now > market_close:
+        return (
+            False,
+            f"Market is closed for the day (Closed at 4:00 PM EST, current time: {now.strftime('%I:%M %p')} EST)",
+        )
+
+    return True, "Market is open"
+
 
 async def _async_gather_stock_data(
     client: finnhub.Client, ticker: str
@@ -284,7 +362,11 @@ async def _async_gather_stock_data(
 
         # Initialize result with default values
         result = {
-            "basic_info": {"profile": {"ticker": ticker}, "basic_financials": {"metric": {}}, "peers": []},
+            "basic_info": {
+                "profile": {"ticker": ticker},
+                "basic_financials": {"metric": {}},
+                "peers": [],
+            },
             "current_price": {
                 "current_price": 0.0,
                 "change": 0.0,
@@ -294,7 +376,7 @@ async def _async_gather_stock_data(
                 "open": 0.0,
                 "previous_close": 0.0,
             },
-            "sentiments": []
+            "sentiments": [],
         }
 
         try:
@@ -318,16 +400,29 @@ async def _async_gather_stock_data(
             # Check if we should use cached price
             use_cached_price = False
             if "current_price" in ticker_cache:
-                cache_time = datetime.fromisoformat(ticker_cache["current_price"]["timestamp"])
-                time_diff = datetime.now() - cache_time
-                
+                cache_time = datetime.fromisoformat(
+                    ticker_cache["current_price"]["timestamp"]
+                )
+
+                is_market_open, market_status = _is_market_hours()
+
                 # Use cache if:
-                # 1. Outside trading hours
-                # 2. Within 2 hours of last cache
-                if not _is_market_hours() or time_diff <= timedelta(hours=2):
-                    use_cached_price = True
-                    logger.info(f"Using cached price for {ticker} ({'outside trading hours' if not _is_market_hours() else 'within 2 hours'})")
-            
+                # 1. Outside trading hours AND cache is from last valid trading day
+                # 2. Within trading hours but within 30 minutes of last cache
+                if not is_market_open:
+                    if not is_cache_stale(cache_time):
+                        use_cached_price = True
+                        logger.info(
+                            f"Using cached price for {ticker} ({market_status})"
+                        )
+                else:
+                    time_diff = datetime.now() - cache_time
+                    if time_diff <= timedelta(minutes=30):
+                        use_cached_price = True
+                        logger.info(
+                            f"Using cached price for {ticker} (within 30 minutes)"
+                        )
+
             if use_cached_price:
                 current_price = ticker_cache["current_price"]["data"]
             else:
@@ -337,12 +432,13 @@ async def _async_gather_stock_data(
                 # Cache the new price data
                 ticker_cache["current_price"] = {
                     "data": current_price,
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 cache[ticker] = ticker_cache
                 _save_cache(cache_file, cache)
-            
+
             result["current_price"] = current_price
+
         except Exception as e:
             logger.error(f"Error getting current price for {ticker}: {str(e)}")
 
@@ -355,12 +451,15 @@ async def _async_gather_stock_data(
                     if news_items:
                         async with aiohttp.ClientSession() as session:
                             scrape_tasks = [
-                                _async_web_scrape(session, item["url"]) for item in news_items
+                                _async_web_scrape(session, item["url"])
+                                for item in news_items
                             ]
                             contents = await asyncio.gather(*scrape_tasks)
 
                         sentiment_tasks = [
-                            _async_sentiment_analysis(content) for content in contents if content
+                            _async_sentiment_analysis(content)
+                            for content in contents
+                            if content
                         ]
                         sentiments = await asyncio.gather(*sentiment_tasks)
 
@@ -384,7 +483,9 @@ async def _async_gather_stock_data(
                         _save_cache(cache_file, cache)
                         result["sentiments"] = sentiment_results
                 except Exception as e:
-                    logger.error(f"Error processing news/sentiments for {ticker}: {str(e)}")
+                    logger.error(
+                        f"Error processing news/sentiments for {ticker}: {str(e)}"
+                    )
             else:
                 logger.info(f"Using cached sentiments for {ticker}")
                 result["sentiments"] = ticker_cache["sentiments"]["data"]
@@ -398,6 +499,94 @@ async def _async_gather_stock_data(
         return result  # Return default structure even on critical error
 
 
+# Helper function to safely format numeric values
+def safe_format_number(value, format_str=".2f"):
+    """Safely format a number that might be None or 'N/A'"""
+    if value is None or value == "N/A":
+        return "N/A"
+    try:
+        return f"{float(value):{format_str}}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
+# Helper function to safely convert value for calculations
+def safe_float(value, default=0.0):
+    """Safely convert a value to float"""
+    if value is None or value == "N/A":
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def interpret_current_ratio(ratio: float, industry: str = None) -> str:
+    """
+    Interpret current ratio with industry context
+    """
+    # Special handling for tech and retail industries which typically run lower ratios
+    is_tech = industry and "technology" in industry.lower()
+    is_retail = industry and "retail" in industry.lower()
+
+    if is_tech or is_retail:
+        if ratio > 1.5:
+            return "Very Strong (above industry average)"
+        if ratio > 1.2:
+            return "Strong"
+        if ratio > 0.8:
+            return "Adequate (typical for industry)"
+        if ratio > 0.6:
+            return "Below Average"
+        return "Concerning"
+    else:
+        # Traditional thresholds for other industries
+        if ratio > 2.0:
+            return "Very Strong"
+        if ratio > 1.5:
+            return "Strong"
+        if ratio > 1.0:
+            return "Adequate"
+        if ratio > 0.8:
+            return "Below Average"
+        return "Concerning"
+
+
+def assess_financial_health(metrics: Dict[str, Any]) -> str:
+    # Get metrics with proper default handling
+    roe = float(metrics.get("roeRfy", 0) or 0)
+    current_ratio = float(metrics.get("currentRatioQuarterly", 0) or 0)
+    profit_margin = float(metrics.get("netProfitMarginTTM", 0) or 0)
+
+    # Score different aspects (0 to 2 points each)
+    points = 0
+
+    # Profitability metrics (heavily weighted due to importance)
+    if roe > 20:
+        points += 2
+    elif roe > 10:
+        points += 1
+
+    if profit_margin > 20:
+        points += 2
+    elif profit_margin > 10:
+        points += 1
+
+    # Liquidity metric (important but shouldn't override strong profitability)
+    if current_ratio > 1.5:
+        points += 2
+    elif current_ratio > 1.0:
+        points += 1
+
+    # Convert points to assessment
+    # Max points = 6
+    if points >= 5:
+        return "strong"
+    elif points >= 3:
+        return "moderate"
+    return "weak"
+
+
 def _compile_report(data: Dict[str, Any]) -> str:
     """
     Compile gathered data into a comprehensive structured report.
@@ -409,15 +598,49 @@ def _compile_report(data: Dict[str, Any]) -> str:
         peers = data["basic_info"]["peers"]
         price_data = data["current_price"]
 
-        # Handle cases where profile might not have all fields (e.g., for ETFs)
-        ticker = profile.get('ticker', 'Unknown')
-        name = profile.get('name', ticker)  # Use ticker as fallback if name is not available
+        # Handle cases where profile might not have all fields
+        ticker = profile.get("ticker", "Unknown")
+        name = profile.get("name", ticker)
+
+        # Safe conversions for financial metrics
+        roe = safe_float(metrics.get("roeRfy"))
+        profit_margin = safe_float(metrics.get("netProfitMarginTTM"))
+        pe_ratio = safe_float(metrics.get("peBasicExclExtraTTM"))
+        current_ratio = safe_float(metrics.get("currentRatioQuarterly"))
+        industry = profile.get("finnhubIndustry", "N/A").lower()
+        current_ratio_interpretation = interpret_current_ratio(current_ratio, industry)
+
+        # Calculate financial health
+        financial_health = assess_financial_health(metrics)
+
+        # Build valuation assessment
+        valuation = (
+            "high" if pe_ratio > 25 else "moderate" if 15 <= pe_ratio <= 25 else "low"
+        )
+
+        overall_analysis = f"{name} shows {financial_health} financial health with {valuation} valuation metrics. "
+
+        # Add strength factors safely
+        strength_factors = []
+        if roe > 15:
+            strength_factors.append(
+                f"excellent return on equity of {safe_format_number(roe)}%"
+            )
+        if profit_margin > 20:
+            strength_factors.append(
+                f"strong profit margin of {safe_format_number(profit_margin)}%"
+            )
+
+        if strength_factors:
+            overall_analysis += (
+                f"The company demonstrates {' and '.join(strength_factors)}. "
+            )
 
         report = f"""
         Comprehensive Stock Analysis Report for {name} ({ticker})
 
         Basic Information:
-        Industry: {profile.get('finnhubIndustry', 'N/A')}
+        Industry: {industry}
         Market Cap: {profile.get('marketCapitalization', 0):,.0f} M USD
         Share Outstanding: {profile.get('shareOutstanding', 0):,.0f} M
         Country: {profile.get('country', 'N/A')}
@@ -461,7 +684,11 @@ def _compile_report(data: Dict[str, Any]) -> str:
 
         3. Liquidity and Solvency:
         Current Ratio: {metrics.get('currentRatioQuarterly', 'N/A')}
-        - Interpretation: {'Strong' if float(metrics.get('currentRatioQuarterly', 0) or 0) > 2 else 'Healthy' if 1.5 <= float(metrics.get('currentRatioQuarterly', 0) or 0) <= 2 else 'Adequate' if 1 <= float(metrics.get('currentRatioQuarterly', 0) or 0) < 1.5 else 'Poor'}
+        - Interpretation: {current_ratio_interpretation}
+        {
+            '- Note: Tech companies often maintain lower current ratios due to reliable cash flows and strong market positions.' 
+            if 'technology' in industry else ''
+        }
 
         Debt-to-Equity Ratio: {metrics.get('totalDebtToEquityQuarterly', 'N/A')}
         - Interpretation: {'Low leverage' if float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) < 0.5 else 'Moderate leverage' if 0.5 <= float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) <= 1 else 'High leverage'}
@@ -479,7 +706,7 @@ def _compile_report(data: Dict[str, Any]) -> str:
 
     Overall Analysis:
     {
-        f"{name} shows {'strong' if float(metrics.get('roeRfy', 0) or 0) > 15 and float(metrics.get('currentRatioQuarterly', 0) or 0) > 1.5 else 'moderate' if float(metrics.get('roeRfy', 0) or 0) > 10 and float(metrics.get('currentRatioQuarterly', 0) or 0) > 1 else 'weak'} financial health with {'high' if float(metrics.get('peBasicExclExtraTTM', 0) or 0) > 25 else 'moderate' if 15 <= float(metrics.get('peBasicExclExtraTTM', 0) or 0) <= 25 else 'low'} valuation metrics. The company's profitability is {'excellent' if float(metrics.get('netProfitMarginTTM', 0) or 0) > 20 else 'good' if float(metrics.get('netProfitMarginTTM', 0) or 0) > 10 else 'average' if float(metrics.get('netProfitMarginTTM', 0) or 0) > 5 else 'poor'}, and it has {'low' if float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) < 0.5 else 'moderate' if float(metrics.get('totalDebtToEquityQuarterly', 0) or 0) < 1 else 'high'} financial leverage. Investors should consider these factors along with their investment goals and risk tolerance."
+        f"{overall_analysis}"
         if any(metrics.get(key) is not None for key in ['roeRfy', 'currentRatioQuarterly', 'peBasicExclExtraTTM', 'netProfitMarginTTM', 'totalDebtToEquityQuarterly'])
         else f"Note: Traditional financial metrics are not applicable for {name} as it appears to be an ETF, money market fund, or other non-traditional security. Please refer to the fund's prospectus and other fund-specific metrics for a more appropriate analysis."
     }
@@ -515,13 +742,13 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "compile_stock_report",
-                    "description": "Search the web using Perplexity AI",
+                    "description": "Compile a comprehensive stock analysis report using Finnhub data",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "ticker": {
                                 "type": "string",
-                                "description": "The ticker to perform a comprehensive stock analysis",
+                                "description": "The stock ticker symbol(s) to analyze (e.g., 'AAPL' or 'AAPL,GOOGL,MSFT')",
                             }
                         },
                         "required": ["ticker"],
