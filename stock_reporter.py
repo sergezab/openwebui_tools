@@ -23,6 +23,7 @@ import torch
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
+from typing import TypedDict, List
 import traceback
 from typing import (
     Dict,
@@ -39,17 +40,17 @@ from typing import (
 from functools import lru_cache
 
 # Configure logging
+log_dir = os.path.expanduser("~")  # This will be user's home directory
+log_file = os.path.join(log_dir, "stock_reporter.log")
+os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-            os.path.join(os.path.dirname(__file__), "stock_reporter.log")
-        ),
-    ],
+    handlers=[logging.StreamHandler(), logging.FileHandler(log_file)],
 )
 logger = logging.getLogger(__name__)
+logging.FileHandler(log_file, mode="w")
 
 
 def _format_date(date: datetime) -> str:
@@ -145,7 +146,13 @@ def _get_current_price(client: finnhub.Client, ticker: str) -> Dict[str, float]:
         }
 
 
-def _get_company_news(client: finnhub.Client, ticker: str) -> List[Dict[str, str]]:
+class NewsItem(TypedDict):
+    url: str
+    title: str
+    summary: str
+
+
+def _get_company_news(client: finnhub.Client, ticker: str) -> List[NewsItem]:
     """
     Fetch recent news articles about the company from Finnhub API.
     Returns an empty list if API call fails.
@@ -157,7 +164,10 @@ def _get_company_news(client: finnhub.Client, ticker: str) -> List[Dict[str, str
             ticker, _format_date(start_date), _format_date(end_date)
         )
         news_items = news[:10]  # Get the first 10 news items
-        return [{"url": item["url"], "title": item["headline"]} for item in news_items]
+        return [
+            {"url": item["url"], "title": item["headline"], "summary": item["summary"]}
+            for item in news_items
+        ]
     except Exception as e:
         logger.warning(
             f"Could not fetch news for {ticker}, using empty news list: {str(e)}"
@@ -199,29 +209,176 @@ async def _async_web_scrape(session: aiohttp.ClientSession, url: str) -> str:
 
 
 # Asynchronous sentiment analysis
-async def _async_sentiment_analysis(content: str) -> Dict[str, Union[str, float]]:
+async def _async_sentiment_analysis(
+    summary: str, title: str
+) -> Dict[str, Union[str, float]]:
     """
-    Perform sentiment analysis on text content.
+    Perform sentiment analysis on text content with improved title-based validation.
     Returns neutral sentiment with 0 confidence if analysis fails.
     """
     try:
         tokenizer, model = _get_sentiment_model()
+
+        # Comprehensive sentiment keyword lists
+        negative_keywords = [
+            "weak",
+            "concern",
+            "risk",
+            "overvalued",
+            "bearish",
+            "sell",
+            "short",
+            "elevated risk",
+            "unreasonable price",
+            "dip",
+            "stubborn",
+            "valuation concerns",
+            "downgrade",
+            "warning",
+            "caution",
+            "negative",
+            "decline",
+            "drop",
+            "fall",
+            "loses",
+            "plunge",
+            "crash",
+            "bubble",
+            "expensive",
+            "correction",
+            "worrying",
+            "deteriorating",
+            "miss",
+            "missed",
+            "missing",
+            "fails",
+            "failed",
+            "disappointing",
+        ]
+        positive_keywords = [
+            "strong",
+            "buy",
+            "bullish",
+            "undervalued",
+            "opportunity",
+            "upgrade",
+            "outperform",
+            "beat",
+            "beats",
+            "beating",
+            "exceeded",
+            "exceeds",
+            "growth",
+            "growing",
+            "positive",
+            "advantage",
+            "potential",
+            "momentum",
+            "successful",
+            "success",
+            "gain",
+            "gains",
+            "winning",
+            "rally",
+            "surge",
+            "breakthrough",
+            "innovative",
+            "leading",
+            "leader",
+            "dominant",
+        ]
+
+        # Combine title and summary to create a fuller context for sentiment evaluation.
+        combined_text = f"Headline: {title}\nSummary: {summary}"
+        combined_text_lower = combined_text.lower()
+
+        # Keyword-based sentiment scoring using the combined text
+        negative_count = sum(
+            1 for word in negative_keywords if word.lower() in combined_text_lower
+        )
+        positive_count = sum(
+            1 for word in positive_keywords if word.lower() in combined_text_lower
+        )
+
+        # Calculate base sentiment from keywords
+        if negative_count > positive_count:
+            base_sentiment = "Negative"
+            base_confidence = min(
+                0.9, negative_count / (negative_count + positive_count + 1)
+            )
+        elif positive_count > negative_count:
+            base_sentiment = "Positive"
+            base_confidence = min(
+                0.9, positive_count / (negative_count + positive_count + 1)
+            )
+        else:
+            base_sentiment = "Neutral"
+            base_confidence = 0.5
+
+        logger.info(
+            f"Keyword-based sentiment: {base_sentiment} (confidence: {base_confidence})"
+        )
+
+        # Perform model-based sentiment analysis on the combined text
         inputs = tokenizer(
-            content, return_tensors="pt", truncation=True, max_length=512
+            combined_text_lower, return_tensors="pt", truncation=True, max_length=512
         )
 
         with torch.no_grad():
             outputs = model(**inputs)
 
-        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        temperature = 1  # adjust this value
+        scaled_logits = outputs.logits / temperature
+        probabilities = torch.nn.functional.softmax(scaled_logits, dim=-1)
+
+        model_sentiment = "<none>"
         sentiment_scores = probabilities.tolist()[0]
+        model_confidence = max(sentiment_scores)
 
-        # Update sentiment labels to match the new model's output
-        sentiments = ["Neutral", "Positive", "Negative"]
-        sentiment = sentiments[sentiment_scores.index(max(sentiment_scores))]
-        confidence = max(sentiment_scores)
+        # Use model.config.id2label if available, otherwise fall back to the list
+        if hasattr(model.config, "id2label"):
+            id2label = (
+                model.config.id2label
+            )  # e.g., {0: 'Neutral', 1: 'Positive', 2: 'Negative'}
+            predicted_index = torch.argmax(probabilities, dim=-1).item()
+            model_sentiment = id2label[predicted_index]
+        else:
+            # Fallback if no config is available
+            # The model's labels assumed here are: 0: Neutral, 1: Positive, 2: Negative.
+            sentiments = ["Neutral", "Positive", "Negative"]
+            model_sentiment = sentiments[sentiment_scores.index(max(sentiment_scores))]
 
-        return {"sentiment": sentiment, "confidence": confidence}
+        logger.info(f"Combined text: {combined_text}")
+        logger.info(f"Logits: {outputs.logits.tolist()}")
+        logger.info(f"Scaled logits: {scaled_logits.tolist()}")
+        logger.info(f"Probabilities: {sentiment_scores}")
+        logger.info(
+            f"Model sentiment: {model_sentiment} (confidence: {model_confidence})"
+        )
+
+        # Combine the two sentiment evaluations
+        if base_sentiment == model_sentiment:
+            sentiment = base_sentiment
+            confidence = (base_confidence + model_confidence) / 2
+        else:
+            # If they disagree, choose the one with higher confidence (with a slight penalty)
+            if base_confidence > model_confidence:
+                sentiment = base_sentiment
+                confidence = base_confidence * 0.8
+            else:
+                sentiment = model_sentiment
+                confidence = model_confidence * 0.8
+
+        formatted_probs = formatted_probs = [
+            [round(p, 5) for p in sample] for sample in probabilities.tolist()
+        ]
+
+        return {
+            "sentiment": model_sentiment.lower(),
+            "confidence": model_confidence,
+            "probabilities": formatted_probs,
+        }
+
     except Exception as e:
         logger.warning(
             f"Error in sentiment analysis, using neutral sentiment: {str(e)}"
@@ -445,34 +602,28 @@ async def _async_gather_stock_data(
 
         try:
             # Get news and process sentiments
-            if not _is_cache_valid(ticker_cache, "sentiments"):
+            if not _is_cache_valid(ticker_cache, "sentiments") or True:
                 logger.info(f"Processing fresh news and sentiments for {ticker}")
                 try:
                     news_items = _get_company_news(client, ticker)
                     if news_items:
-                        async with aiohttp.ClientSession() as session:
-                            scrape_tasks = [
-                                _async_web_scrape(session, item["url"])
-                                for item in news_items
-                            ]
-                            contents = await asyncio.gather(*scrape_tasks)
-
+                        # Create sentiment analysis tasks directly using the summary and title
                         sentiment_tasks = [
-                            _async_sentiment_analysis(content)
-                            for content in contents
-                            if content
+                            _async_sentiment_analysis(item["summary"], item["title"])
+                            for item in news_items
                         ]
                         sentiments = await asyncio.gather(*sentiment_tasks)
 
                         sentiment_results = [
                             {
-                                "url": news_items[i]["url"],
-                                "title": news_items[i]["title"],
+                                "url": item["url"],
+                                "title": item["title"],
+                                "summary": item["summary"],
                                 "sentiment": sentiment["sentiment"],
                                 "confidence": sentiment["confidence"],
+                                "probabilities": sentiment["probabilities"],
                             }
-                            for i, sentiment in enumerate(sentiments)
-                            if contents[i]
+                            for item, sentiment in zip(news_items, sentiments)
                         ]
 
                         # Cache sentiment results
@@ -754,7 +905,7 @@ def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> st
             score_result = "strong"
         elif score_percentage >= 40:
             score_result = "moderate"
-       
+
         return f"{score_result} {round(score_percentage)}% - {industry}"
 
     except Exception as e:
@@ -826,25 +977,36 @@ Recent News Sentiment:"""
 
         # Add sentiment analysis summary
         positive_count = sum(
-            1 for item in data["sentiments"] if item["sentiment"] == "Positive"
+            1 for item in data["sentiments"] if item["sentiment"] == "positive"
         )
         negative_count = sum(
-            1 for item in data["sentiments"] if item["sentiment"] == "Negative"
+            1 for item in data["sentiments"] if item["sentiment"] == "negative"
         )
         total_count = len(data["sentiments"])
 
+        # Updated sentiment summary logic
         if total_count > 0:
-            sentiment_ratio = positive_count / total_count
+            weighted_sentiment = sum(
+                float(item["confidence"])
+                for item in data["sentiments"]
+                if item["sentiment"] == "positive"
+            )
+            total_confidence = sum(
+                float(item["confidence"]) for item in data["sentiments"]
+            )
+            sentiment_ratio = (
+                weighted_sentiment / total_confidence if total_confidence > 0 else 0.5
+            )
             overall_sentiment = (
                 "Bullish"
                 if sentiment_ratio > 0.6
                 else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
             )
-            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
+            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive, weighted by confidence)"
 
             # Add all recent news
             for item in data["sentiments"]:
-                report += f"\n• {item['title']} ({item['sentiment']})"
+                report += f"\n• {item['sentiment']}({item['confidence']:.2f}%) -  {item['title']} ({item['summary']})"
 
         return report
     except Exception as e:
