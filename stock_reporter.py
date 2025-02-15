@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 from typing import TypedDict, List
+import difflib
 import traceback
 from typing import (
     Dict,
@@ -40,22 +41,51 @@ from typing import (
 from functools import lru_cache
 
 # Configure logging
-log_dir = os.path.expanduser("~")  # This will be user's home directory
+logger = logging.getLogger(__name__)
+logger.setLevel(
+    logging.INFO
+)  # Changed from WARNING to INFO for better cache visibility
+
+# Create formatter
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# Create a FileHandler
+log_dir = os.path.expanduser("~")
 log_file = os.path.join(log_dir, "stock_reporter.log")
 os.makedirs(os.path.dirname(log_file), exist_ok=True)
+file_handler = logging.FileHandler(log_file, mode="a")  # using append mode here
+file_handler.setLevel(logging.INFO)  # Changed from WARNING to INFO
+file_handler.setFormatter(formatter)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(log_file)],
-)
-logger = logging.getLogger(__name__)
-logging.FileHandler(log_file, mode="w")
+# Create a StreamHandler (console)
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)  # Changed from WARNING to INFO
+stream_handler.setFormatter(formatter)
+
+# Clear any existing handlers if necessary (be cautious if you know the upper app has its own config)
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# Add our handlers to our logger
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
 
 def _format_date(date: datetime) -> str:
     """Helper function to format date for Finnhub API"""
     return date.strftime("%Y-%m-%d")
+
+
+def is_similar(text1: str, text2: str, threshold: float = 0.9) -> bool:
+    """
+    Returns True if text1 and text2 are similar above the threshold.
+    The texts are first stripped and lowercased for a simple comparison.
+    """
+    # Remove any extra spaces and lowercase the texts
+    text1_clean = text1.strip().lower()
+    text2_clean = text2.strip().lower()
+    similarity = difflib.SequenceMatcher(None, text1_clean, text2_clean).ratio()
+    return similarity >= threshold
 
 
 # Caching for expensive operations
@@ -374,8 +404,8 @@ async def _async_sentiment_analysis(
         ]
 
         return {
-            "sentiment": model_sentiment.lower(),
-            "confidence": model_confidence,
+            "sentiment": sentiment.lower(),
+            "confidence": confidence,
             "probabilities": formatted_probs,
         }
 
@@ -387,12 +417,52 @@ async def _async_sentiment_analysis(
 
 
 # Asynchronous data gathering
+def _clean_cache_data(
+    cache_data: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """Clean stale entries from cache data"""
+    cleaned_cache = {}
+    est = pytz.timezone("US/Eastern")
+    current_time = datetime.now(est)
+
+    for ticker, ticker_data in cache_data.items():
+        cleaned_ticker_data = {}
+        for data_type, type_data in ticker_data.items():
+            if "timestamp" in type_data:
+                try:
+                    cache_time = datetime.fromisoformat(type_data["timestamp"])
+                    if cache_time.tzinfo is None:
+                        cache_time = est.localize(cache_time)
+
+                    # Keep data only if it's not stale
+                    if not is_cache_stale(cache_time):
+                        cleaned_ticker_data[data_type] = type_data
+                    else:
+                        logger.info(f"Removing stale {data_type} cache for {ticker}")
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        f"Error processing cache timestamp for {ticker}: {str(e)}"
+                    )
+                    continue
+
+        if cleaned_ticker_data:
+            cleaned_cache[ticker] = cleaned_ticker_data
+
+    return cleaned_cache
+
+
 def _load_cache(cache_file: str) -> Dict[str, Any]:
-    """Load cached stock data from file"""
+    """Load cached stock data from file and clean stale entries"""
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
-                return json.load(f)
+                cache_data = json.load(f)
+                # Clean stale entries from cache
+                cleaned_cache = _clean_cache_data(cache_data)
+                # If cache was cleaned, save it back
+                if cleaned_cache != cache_data:
+                    _save_cache(cache_file, cleaned_cache)
+                return cleaned_cache
         except json.JSONDecodeError as e:
             logger.error(f"Error loading cache from {cache_file}: {str(e)}")
             return {}
@@ -415,8 +485,12 @@ def _is_cache_valid(cached_data: Dict[str, Any], data_type: str) -> bool:
     if not cached_data or data_type not in cached_data:
         return False
     try:
+        est = pytz.timezone("US/Eastern")
         cache_time = datetime.fromisoformat(cached_data[data_type]["timestamp"])
-        return cache_time.date() == datetime.now().date()
+        if cache_time.tzinfo is None:
+            cache_time = est.localize(cache_time)
+        current_time = datetime.now(est)
+        return cache_time.date() == current_time.date()
     except Exception as e:
         logger.error(f"Error validating cache for {data_type}: {str(e)}")
         return False
@@ -449,7 +523,7 @@ def get_last_trading_day(current_time: datetime) -> datetime:
 
 def is_cache_stale(cache_time: datetime) -> bool:
     """
-    Check if cached data is stale by comparing with last valid trading day
+    Check if cached data is stale by comparing with last valid trading day and market hours
     """
     est = pytz.timezone("US/Eastern")
     if cache_time.tzinfo is None:
@@ -460,18 +534,37 @@ def is_cache_stale(cache_time: datetime) -> bool:
 
     # Convert to dates for comparison
     cache_date = cache_time.date()
+    current_date = current_time.date()
     last_trading_date = last_trading.date()
 
     # If cache is from before the last trading day, it's stale
     if cache_date < last_trading_date:
         return True
 
-    # If cache is from last trading day, check if it was after market close (4 PM)
-    if cache_date == last_trading_date:
-        market_close = cache_time.replace(hour=16, minute=0, second=0, microsecond=0)
-        return cache_time < market_close
+    # During market hours (9:30 AM - 4:00 PM EST)
+    market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+    is_market_open = (
+        market_open <= current_time <= market_close and current_time.weekday() < 5
+    )
 
-    return False
+    # If market is open, cache should be no older than 60 minutes
+    if is_market_open:
+        cache_age = (current_time - cache_time).total_seconds() / 60
+        return cache_age > 60
+
+    # If cache is from today but outside market hours, it's not stale
+    if cache_date == current_date:
+        return False
+
+    # If cache is from last trading day, it must be from after market close
+    if cache_date == last_trading_date:
+        last_market_close = cache_time.replace(
+            hour=16, minute=0, second=0, microsecond=0
+        )
+        return cache_time < last_market_close
+
+    return True
 
 
 def _is_market_hours() -> Tuple[bool, str]:
@@ -544,7 +637,7 @@ async def _async_gather_stock_data(
                 basic_info = _get_basic_info(client, ticker)
                 ticker_cache["basic_info"] = {
                     "data": basic_info,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(pytz.timezone("US/Eastern")).isoformat(),
                 }
                 _save_cache(cache_file, cache)
             else:
@@ -561,25 +654,23 @@ async def _async_gather_stock_data(
                 cache_time = datetime.fromisoformat(
                     ticker_cache["current_price"]["timestamp"]
                 )
-
+                est = pytz.timezone("US/Eastern")
+                if cache_time.tzinfo is None:
+                    cache_time = est.localize(cache_time)
                 is_market_open, market_status = _is_market_hours()
-
-                # Use cache if:
-                # 1. Outside trading hours AND cache is from last valid trading day
-                # 2. Within trading hours but within 30 minutes of last cache
-                if not is_market_open:
-                    if not is_cache_stale(cache_time):
-                        use_cached_price = True
-                        logger.info(
-                            f"Using cached price for {ticker} ({market_status})"
-                        )
+                # Check if cache is stale
+                if not is_cache_stale(cache_time):
+                    use_cached_price = True
+                    est_time = datetime.now(est)
+                    cache_age = (est_time - cache_time).total_seconds() / 60
+                    logger.info(
+                        f"Using cached price for {ticker} ({market_status}, cache age: {cache_age:.1f} minutes, EST: {est_time.strftime('%I:%M %p')})"
+                    )
                 else:
-                    time_diff = datetime.now() - cache_time
-                    if time_diff <= timedelta(minutes=30):
-                        use_cached_price = True
-                        logger.info(
-                            f"Using cached price for {ticker} (within 30 minutes)"
-                        )
+                    est_time = datetime.now(est)
+                    logger.info(
+                        f"Cache stale for {ticker} (EST: {est_time.strftime('%I:%M %p')})"
+                    )
 
             if use_cached_price:
                 current_price = ticker_cache["current_price"]["data"]
@@ -590,7 +681,7 @@ async def _async_gather_stock_data(
                 # Cache the new price data
                 ticker_cache["current_price"] = {
                     "data": current_price,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(pytz.timezone("US/Eastern")).isoformat(),
                 }
                 cache[ticker] = ticker_cache
                 _save_cache(cache_file, cache)
@@ -602,15 +693,27 @@ async def _async_gather_stock_data(
 
         try:
             # Get news and process sentiments
-            if not _is_cache_valid(ticker_cache, "sentiments") or True:
+            if not _is_cache_valid(ticker_cache, "sentiments"):
                 logger.info(f"Processing fresh news and sentiments for {ticker}")
                 try:
                     news_items = _get_company_news(client, ticker)
                     if news_items:
+
+                        effective_summaries = [
+                            (
+                                ""
+                                if is_similar(item["title"], item["summary"])
+                                else item["summary"]
+                            )
+                            for item in news_items
+                        ]
+
                         # Create sentiment analysis tasks directly using the summary and title
                         sentiment_tasks = [
-                            _async_sentiment_analysis(item["summary"], item["title"])
-                            for item in news_items
+                            _async_sentiment_analysis(effective_summary, item["title"])
+                            for effective_summary, item in zip(
+                                effective_summaries, news_items
+                            )
                         ]
                         sentiments = await asyncio.gather(*sentiment_tasks)
 
@@ -618,18 +721,22 @@ async def _async_gather_stock_data(
                             {
                                 "url": item["url"],
                                 "title": item["title"],
-                                "summary": item["summary"],
+                                "summary": effective_summary,
                                 "sentiment": sentiment["sentiment"],
                                 "confidence": sentiment["confidence"],
                                 "probabilities": sentiment["probabilities"],
                             }
-                            for item, sentiment in zip(news_items, sentiments)
+                            for item, sentiment, effective_summary in zip(
+                                news_items, sentiments, effective_summaries
+                            )
                         ]
 
                         # Cache sentiment results
                         ticker_cache["sentiments"] = {
                             "data": sentiment_results,
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": datetime.now(
+                                pytz.timezone("US/Eastern")
+                            ).isoformat(),
                         }
                         cache[ticker] = ticker_cache
                         _save_cache(cache_file, cache)
@@ -1002,11 +1109,17 @@ Recent News Sentiment:"""
                 if sentiment_ratio > 0.6
                 else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
             )
-            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive, weighted by confidence)"
+            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
 
             # Add all recent news
             for item in data["sentiments"]:
-                report += f"\n• {item['sentiment']}({item['confidence']:.2f}%) -  {item['title']} ({item['summary']})"
+                title = item["title"]
+                summary = item["summary"]
+                if summary:
+                    summary_str = f" - {summary}"
+                else:
+                    summary_str = ""
+                report += f"\n• {item['sentiment']} - {title}{summary_str}"
 
         return report
     except Exception as e:
