@@ -14,6 +14,7 @@ import finnhub
 import requests
 import aiohttp
 import asyncio
+import shelve
 import os
 import json
 import logging
@@ -58,17 +59,17 @@ file_handler.setLevel(logging.INFO)  # Changed from WARNING to INFO
 file_handler.setFormatter(formatter)
 
 # Create a StreamHandler (console)
-stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.INFO)  # Changed from WARNING to INFO
-stream_handler.setFormatter(formatter)
+# stream_handler = logging.StreamHandler()
+# stream_handler.setLevel(logging.INFO)  # Changed from WARNING to INFO
+# stream_handler.setFormatter(formatter)
 
 # Clear any existing handlers if necessary (be cautious if you know the upper app has its own config)
-if logger.hasHandlers():
-    logger.handlers.clear()
+# if logger.hasHandlers():
+#    logger.handlers.clear()
 
 # Add our handlers to our logger
 logger.addHandler(file_handler)
-logger.addHandler(stream_handler)
+# logger.addHandler(stream_handler)
 
 
 def _format_date(date: datetime) -> str:
@@ -164,16 +165,7 @@ def _get_current_price(client: finnhub.Client, ticker: str) -> Dict[str, float]:
         }
     except Exception as e:
         logger.error(f"Error fetching current price for {ticker}: {str(e)}")
-        # Return default values that won't break the report
-        return {
-            "current_price": 0.0,
-            "change": 0.0,
-            "change_amount": 0.0,
-            "high": 0.0,
-            "low": 0.0,
-            "open": 0.0,
-            "previous_close": 0.0,
-        }
+        return None
 
 
 class NewsItem(TypedDict):
@@ -379,9 +371,9 @@ async def _async_sentiment_analysis(
             model_sentiment = sentiments[sentiment_scores.index(max(sentiment_scores))]
 
         logger.info(f"Combined text: {combined_text}")
-        logger.info(f"Logits: {outputs.logits.tolist()}")
-        logger.info(f"Scaled logits: {scaled_logits.tolist()}")
-        logger.info(f"Probabilities: {sentiment_scores}")
+        # logger.info(f"Logits: {outputs.logits.tolist()}")
+        # logger.info(f"Scaled logits: {scaled_logits.tolist()}")
+        # logger.info(f"Probabilities: {sentiment_scores}")
         logger.info(
             f"Model sentiment: {model_sentiment} (confidence: {model_confidence})"
         )
@@ -417,67 +409,6 @@ async def _async_sentiment_analysis(
 
 
 # Asynchronous data gathering
-def _clean_cache_data(
-    cache_data: Dict[str, Dict[str, Any]]
-) -> Dict[str, Dict[str, Any]]:
-    """Clean stale entries from cache data"""
-    cleaned_cache = {}
-    est = pytz.timezone("US/Eastern")
-    current_time = datetime.now(est)
-
-    for ticker, ticker_data in cache_data.items():
-        cleaned_ticker_data = {}
-        for data_type, type_data in ticker_data.items():
-            if "timestamp" in type_data:
-                try:
-                    cache_time = datetime.fromisoformat(type_data["timestamp"])
-                    if cache_time.tzinfo is None:
-                        cache_time = est.localize(cache_time)
-
-                    # Keep data only if it's not stale
-                    if not is_cache_stale(cache_time):
-                        cleaned_ticker_data[data_type] = type_data
-                    else:
-                        logger.info(f"Removing stale {data_type} cache for {ticker}")
-                except (ValueError, TypeError) as e:
-                    logger.warning(
-                        f"Error processing cache timestamp for {ticker}: {str(e)}"
-                    )
-                    continue
-
-        if cleaned_ticker_data:
-            cleaned_cache[ticker] = cleaned_ticker_data
-
-    return cleaned_cache
-
-
-def _load_cache(cache_file: str) -> Dict[str, Any]:
-    """Load cached stock data from file and clean stale entries"""
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                cache_data = json.load(f)
-                # Clean stale entries from cache
-                cleaned_cache = _clean_cache_data(cache_data)
-                # If cache was cleaned, save it back
-                if cleaned_cache != cache_data:
-                    _save_cache(cache_file, cleaned_cache)
-                return cleaned_cache
-        except json.JSONDecodeError as e:
-            logger.error(f"Error loading cache from {cache_file}: {str(e)}")
-            return {}
-    return {}
-
-
-def _save_cache(cache_file: str, cache_data: Dict[str, Any]) -> None:
-    """Save cached stock data to file"""
-    try:
-        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-        with open(cache_file, "w") as f:
-            json.dump(cache_data, f)
-    except Exception as e:
-        logger.error(f"Error saving cache to {cache_file}: {str(e)}")
-        raise
 
 
 def _is_cache_valid(cached_data: Dict[str, Any], data_type: str) -> bool:
@@ -598,7 +529,7 @@ def _is_market_hours() -> Tuple[bool, str]:
 
 
 async def _async_gather_stock_data(
-    client: finnhub.Client, ticker: str
+    client: finnhub.Client, ticker: str, cache: shelve.Shelf
 ) -> Dict[str, Any]:
     """
     Gather all stock data with graceful error handling.
@@ -606,9 +537,7 @@ async def _async_gather_stock_data(
     Caches current price if within 2 hours of request or outside trading hours.
     """
     try:
-        # Initialize cache
-        cache_file = os.path.join(os.path.dirname(__file__), "stock_cache.json")
-        cache = _load_cache(cache_file)
+        # Get the ticker's cache data; if not present, start with an empty dict
         ticker_cache = cache.get(ticker, {})
 
         # Initialize result with default values
@@ -635,11 +564,22 @@ async def _async_gather_stock_data(
             if not _is_cache_valid(ticker_cache, "basic_info"):
                 logger.info(f"Fetching fresh basic info for {ticker}")
                 basic_info = _get_basic_info(client, ticker)
-                ticker_cache["basic_info"] = {
-                    "data": basic_info,
-                    "timestamp": datetime.now(pytz.timezone("US/Eastern")).isoformat(),
-                }
-                _save_cache(cache_file, cache)
+                # Check if the basic info looks valid (e.g. has a 'name')
+                if basic_info.get("profile", {}).get("name"):
+                    ticker_cache["basic_info"] = {
+                        "data": basic_info,
+                        "timestamp": datetime.now(
+                            pytz.timezone("US/Eastern")
+                        ).isoformat(),
+                    }
+                else:
+                    logger.error(
+                        f"Basic info for {ticker} is incomplete; not updating cache."
+                    )
+                    # Optionally, if previous cached data exists, you might keep that.
+                    basic_info = ticker_cache.get("basic_info", {}).get(
+                        "data", basic_info
+                    )
             else:
                 logger.info(f"Using cached basic info for {ticker}")
                 basic_info = ticker_cache["basic_info"]["data"]
@@ -678,14 +618,33 @@ async def _async_gather_stock_data(
                 # Get fresh price data
                 logger.info(f"Fetching fresh price for {ticker}")
                 current_price = _get_current_price(client, ticker)
-                # Cache the new price data
-                ticker_cache["current_price"] = {
-                    "data": current_price,
-                    "timestamp": datetime.now(pytz.timezone("US/Eastern")).isoformat(),
-                }
-                cache[ticker] = ticker_cache
-                _save_cache(cache_file, cache)
-
+                if current_price is None:
+                    # If the API call failed (e.g. due to rate limit), log and optionally update status.
+                    error_msg = f"Failed to fetch fresh price for {ticker}. Using cached price if available."
+                    logger.error(error_msg)
+                    # Optionally: await __event_emitter__({...})
+                    if "current_price" in ticker_cache:
+                        current_price = ticker_cache["current_price"]["data"]
+                        logger.info(f"Using previously cached price for {ticker}.")
+                    else:
+                        # No cached price available; use a fallback value or decide how to handle it.
+                        current_price = {
+                            "current_price": 0.0,
+                            "change": 0.0,
+                            "change_amount": 0.0,
+                            "high": 0.0,
+                            "low": 0.0,
+                            "open": 0.0,
+                            "previous_close": 0.0,
+                        }
+                else:
+                    # Only update the cache if fresh data is obtained
+                    ticker_cache["current_price"] = {
+                        "data": current_price,
+                        "timestamp": datetime.now(
+                            pytz.timezone("US/Eastern")
+                        ).isoformat(),
+                    }
             result["current_price"] = current_price
 
         except Exception as e:
@@ -709,6 +668,15 @@ async def _async_gather_stock_data(
                         ]
 
                         # Create sentiment analysis tasks directly using the summary and title
+                        # sentiment_tasks = [
+                        #    _async_sentiment_analysis(effective_summary, item["title"])
+                        #    for effective_summary, item in zip(
+                        #        effective_summaries, news_items
+                        #    )
+                        # ]
+                        # sentiments = await asyncio.gather(*sentiment_tasks)
+
+                        # Wrap the CPU-bound work in a thread
                         sentiment_tasks = [
                             _async_sentiment_analysis(effective_summary, item["title"])
                             for effective_summary, item in zip(
@@ -738,8 +706,6 @@ async def _async_gather_stock_data(
                                 pytz.timezone("US/Eastern")
                             ).isoformat(),
                         }
-                        cache[ticker] = ticker_cache
-                        _save_cache(cache_file, cache)
                         result["sentiments"] = sentiment_results
                 except Exception as e:
                     logger.error(
@@ -750,6 +716,9 @@ async def _async_gather_stock_data(
                 result["sentiments"] = ticker_cache["sentiments"]["data"]
         except Exception as e:
             logger.error(f"Error in sentiment processing for {ticker}: {str(e)}")
+
+        # Write updated ticker data back to the shared shelve cache
+        cache[ticker] = ticker_cache
 
         return result
 
@@ -1202,61 +1171,63 @@ class Tools:
             )
             self.client = finnhub.Client(api_key=self.valves.FINNHUB_API_KEY)
 
-            # Split tickers and clean them
-            tickers = [t.strip() for t in ticker_str.split(",") if t.strip()]
-            if not tickers:
-                raise ValueError("No valid tickers provided")
-            logger.info(f"Processing tickers: {tickers}")
+            # Open the shelve cache
+            with shelve.open(
+                os.path.join(os.path.dirname(__file__), "stock_cache_shelve"),
+                writeback=True,
+            ) as cache:
+                # Split tickers and clean them
+                tickers = [t.strip() for t in ticker_str.split(",") if t.strip()]
+                if not tickers:
+                    raise ValueError("No valid tickers provided")
+                logger.info(f"Processing tickers: {tickers}")
 
-            combined_report = ""
+                combined_report = ""
 
-            # Process each ticker
-            for idx, single_ticker in enumerate(tickers):
-                logger.info(
-                    f"Processing ticker {idx + 1}/{len(tickers)}: {single_ticker}"
-                )
+                # Process each ticker
+                for idx, single_ticker in enumerate(tickers):
+                    logger.info(
+                        f"Processing ticker {idx + 1}/{len(tickers)}: {single_ticker}"
+                    )
 
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(tickers)})",
-                            "done": False,
-                        },
-                    }
-                )
-                data = await _async_gather_stock_data(self.client, single_ticker)
+                    if idx % 4 == 0 or idx == len(tickers) - 1:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(tickers)})",
+                                    "done": False,
+                                },
+                            }
+                        )
 
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Compiling stock report for {single_ticker}",
-                            "done": False,
-                        },
-                    }
-                )
-                report = _compile_report(data)
-                last_price = data["current_price"]["current_price"]
+                    # Pass the shared shelve cache to the data gathering function
+                    data = await _async_gather_stock_data(
+                        self.client, single_ticker, cache
+                    )
 
-                # Add separator between reports if this isn't the first report
-                # if combined_report:
-                combined_report += "\n" + "=" * 8 + "\n\n"
+                    report = _compile_report(data)
+                    last_price = data["current_price"]["current_price"]
 
-                combined_report += report
+                    # Add separator between reports if this isn't the first report
+                    # if combined_report:
+                    combined_report += "\n" + "=" * 8 + "\n\n"
 
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Finished report for {single_ticker} - latest price: {str(last_price)}",
-                            "done": idx == len(tickers) - 1,
-                        },
-                    }
-                )
+                    combined_report += report
 
-            logger.info("Successfully completed stock report compilation")
-            return f"Tickers {tickers}\n\n Combined Report:\n{combined_report}"
+                    if idx == len(tickers) - 1:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"Finished report for {single_ticker} - latest price: {str(last_price)}",
+                                    "done": idx == len(tickers) - 1,
+                                },
+                            }
+                        )
+
+                logger.info("Successfully completed stock report compilation")
+                return f"Tickers {tickers}\n\n Combined Report:\n{combined_report}"
 
         except Exception as e:
             tb = traceback.extract_tb(e.__traceback__)
