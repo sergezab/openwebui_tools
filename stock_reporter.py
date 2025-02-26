@@ -27,6 +27,9 @@ from datetime import datetime, timedelta
 from typing import TypedDict, List
 import difflib
 import traceback
+from functools import wraps
+import time
+import random
 from typing import (
     Dict,
     Any,
@@ -98,6 +101,104 @@ def _get_sentiment_model():
     return tokenizer, model
 
 
+def is_html_response(response):
+    """Check if a response is HTML instead of the expected JSON"""
+    if isinstance(response, str) and (
+        "<html" in response.lower() or "<!doctype" in response.lower()
+    ):
+        return True
+    return False
+
+
+def retry_with_backoff(max_retries=3, initial_backoff=1, max_backoff=10):
+    """
+    Retry decorator with exponential backoff, with special handling for API rate limits
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retry_count = 0
+            backoff = initial_backoff
+
+            while retry_count < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    error_str = str(e)
+
+                    # Check if this is a rate limit error (429)
+                    is_rate_limit = (
+                        "429" in error_str or "API limit reached" in error_str
+                    )
+
+                    # Don't retry for errors that aren't network/timeout/rate limit related
+                    if not (
+                        is_rate_limit
+                        or "502" in error_str
+                        or "504" in error_str
+                        or "timeout" in error_str.lower()
+                        or "connection" in error_str.lower()
+                    ):
+                        raise
+
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        raise  # Max retries reached, re-raise the exception
+
+                    # For rate limit errors, use a longer backoff
+                    if is_rate_limit:
+                        sleep_time = min(backoff * 3, 30) + random.uniform(
+                            0, 1
+                        )  # Longer wait for rate limits
+                        logger.warning(
+                            f"API rate limit hit. Waiting {sleep_time:.2f}s before retry {retry_count}/{max_retries}"
+                        )
+                    else:
+                        sleep_time = backoff + random.uniform(0, 1)
+                        logger.warning(
+                            f"Retrying in {sleep_time:.2f}s after error: {error_str}"
+                        )
+
+                    time.sleep(sleep_time)
+
+                    # Exponential backoff
+                    backoff = min(backoff * 2, max_backoff)
+
+            # This should never be reached due to the raise inside the loop
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+# Wrap all API methods with retry
+@retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
+def get_company_profile(client, ticker):
+    return client.company_profile2(symbol=ticker, timeout=10)
+
+
+@retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
+def get_company_financials(client, ticker, metric_type="all"):
+    return client.company_basic_financials(ticker, metric_type, timeout=10)
+
+
+@retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
+def get_company_peers(client, ticker):
+    return client.company_peers(ticker)
+
+
+@retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
+def get_stock_quote(client, ticker):
+    return client.quote(ticker, timeout=10)
+
+
+@retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
+def get_news(client, ticker, start_date, end_date):
+    return client.company_news(ticker, start_date, end_date, timeout=10)
+
+
 def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     """
     Fetch comprehensive company information from Finnhub API.
@@ -112,9 +213,16 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     try:
         # Try to get profile
         try:
-            profile = client.company_profile2(symbol=ticker)
-            if profile:
+            profile = get_company_profile(client, ticker)
+            # Check if the response is valid JSON (not HTML)
+            if is_html_response(profile):
+                logger.warning(
+                    f"Received HTML response instead of JSON for {ticker} profile"
+                )
+            elif isinstance(profile, dict):
                 result["profile"] = profile
+            else:
+                logger.warning(f"Invalid profile response format for {ticker}")
         except Exception as e:
             logger.warning(
                 f"Could not fetch profile for {ticker}, using minimal profile: {str(e)}"
@@ -123,8 +231,10 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
         # Try to get financials
         try:
             basic_financials = client.company_basic_financials(ticker, "all")
-            if basic_financials and "metric" in basic_financials:
+            if isinstance(basic_financials, dict) and "metric" in basic_financials:
                 result["basic_financials"] = basic_financials
+            else:
+                logger.warning(f"Invalid financials response format for {ticker}")
         except Exception as e:
             logger.warning(
                 f"Could not fetch financials for {ticker}, using empty financials: {str(e)}"
@@ -133,8 +243,10 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
         # Try to get peers
         try:
             peers = client.company_peers(ticker)
-            if peers:
+            if isinstance(peers, list):
                 result["peers"] = peers
+            else:
+                logger.warning(f"Invalid peers response format for {ticker}")
         except Exception as e:
             logger.warning(
                 f"Could not fetch peers for {ticker}, using empty peers list: {str(e)}"
