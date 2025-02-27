@@ -181,7 +181,7 @@ def get_company_profile(client, ticker):
 
 @retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
 def get_company_financials(client, ticker, metric_type="all"):
-    return client.company_basic_financials(ticker, metric_type, timeout=10)
+    return client.company_basic_financials(ticker, metric_type)
 
 
 @retry_with_backoff(max_retries=3, initial_backoff=2, max_backoff=15)
@@ -205,7 +205,7 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     Handles failures gracefully by providing default values.
     """
     result = {
-        "profile": {"ticker": ticker},  # Minimal profile with just the ticker
+        "profile": {"ticker": ticker, "name": ticker},  # Ensure we always have name and ticker
         "basic_financials": {"metric": {}},  # Empty financials
         "peers": [],  # Empty peers list
     }
@@ -220,6 +220,11 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
                     f"Received HTML response instead of JSON for {ticker} profile"
                 )
             elif isinstance(profile, dict):
+                # Ensure we have both name and ticker in the profile
+                if not profile.get('ticker'):
+                    profile['ticker'] = ticker
+                if not profile.get('name'):
+                    profile['name'] = ticker
                 result["profile"] = profile
             else:
                 logger.warning(f"Invalid profile response format for {ticker}")
@@ -230,7 +235,7 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
 
         # Try to get financials
         try:
-            basic_financials = client.company_basic_financials(ticker, "all")
+            basic_financials = get_company_financials(client, ticker, "all")
             if isinstance(basic_financials, dict) and "metric" in basic_financials:
                 result["basic_financials"] = basic_financials
             else:
@@ -242,7 +247,7 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
 
         # Try to get peers
         try:
-            peers = client.company_peers(ticker)
+            peers = get_company_peers(client, ticker)
             if isinstance(peers, list):
                 result["peers"] = peers
             else:
@@ -644,40 +649,42 @@ async def _async_gather_stock_data(
     client: finnhub.Client, ticker: str, cache: shelve.Shelf
 ) -> Dict[str, Any]:
     """
-    Gather all stock data with graceful error handling.
+    Gather all stock data with improved error handling.
     Returns minimal valid data structure even if some parts fail.
     Caches current price if within 2 hours of request or outside trading hours.
     """
+    # Initialize result with valid default values
+    result = {
+        "basic_info": {
+            "profile": {"ticker": ticker, "name": ticker},  # Always include name and ticker
+            "basic_financials": {"metric": {}},
+            "peers": [],
+        },
+        "current_price": {
+            "current_price": 0.0,
+            "change": 0.0,
+            "change_amount": 0.0,
+            "high": 0.0,
+            "low": 0.0,
+            "open": 0.0,
+            "previous_close": 0.0,
+        },
+        "sentiments": [],
+    }
+    
     try:
         # Get the ticker's cache data; if not present, start with an empty dict
         ticker_cache = cache.get(ticker, {})
-
-        # Initialize result with default values
-        result = {
-            "basic_info": {
-                "profile": {"ticker": ticker},
-                "basic_financials": {"metric": {}},
-                "peers": [],
-            },
-            "current_price": {
-                "current_price": 0.0,
-                "change": 0.0,
-                "change_amount": 0.0,
-                "high": 0.0,
-                "low": 0.0,
-                "open": 0.0,
-                "previous_close": 0.0,
-            },
-            "sentiments": [],
-        }
 
         try:
             # Get basic info (use cache if valid)
             if not _is_cache_valid(ticker_cache, "basic_info"):
                 logger.info(f"Fetching fresh basic info for {ticker}")
                 basic_info = _get_basic_info(client, ticker)
-                # Check if the basic info looks valid (e.g. has a 'name')
-                if basic_info.get("profile", {}).get("name"):
+                
+                # Check if the basic info looks valid (e.g. has a 'name' and 'ticker')
+                profile = basic_info.get("profile", {})
+                if profile.get("name") and profile.get("ticker"):
                     ticker_cache["basic_info"] = {
                         "data": basic_info,
                         "timestamp": datetime.now(
@@ -688,16 +695,27 @@ async def _async_gather_stock_data(
                     logger.error(
                         f"Basic info for {ticker} is incomplete; not updating cache."
                     )
-                    # Optionally, if previous cached data exists, you might keep that.
-                    basic_info = ticker_cache.get("basic_info", {}).get(
-                        "data", basic_info
-                    )
+                    # If we have previous cached data, use that instead
+                    if "basic_info" in ticker_cache:
+                        logger.info(f"Using previously cached basic info for {ticker}")
+                        basic_info = ticker_cache["basic_info"]["data"]
             else:
                 logger.info(f"Using cached basic info for {ticker}")
                 basic_info = ticker_cache["basic_info"]["data"]
+            
+            # Ensure result has valid basic info
+            if not basic_info.get("profile", {}).get("name"):
+                logger.warning(f"Name missing in profile for {ticker}, using ticker as name")
+                basic_info.setdefault("profile", {})["name"] = ticker
+            
+            if not basic_info.get("profile", {}).get("ticker"):
+                logger.warning(f"Ticker missing in profile for {ticker}, adding it")
+                basic_info.setdefault("profile", {})["ticker"] = ticker
+                
             result["basic_info"] = basic_info
         except Exception as e:
             logger.error(f"Error getting basic info for {ticker}: {str(e)}")
+            # We already initialized result with valid defaults
 
         try:
             # Check if we should use cached price
@@ -732,14 +750,13 @@ async def _async_gather_stock_data(
                 current_price = _get_current_price(client, ticker)
                 if current_price is None:
                     # If the API call failed (e.g. due to rate limit), log and optionally update status.
-                    error_msg = f"Failed to fetch fresh price for {ticker}. Using cached price if available."
-                    logger.error(error_msg)
-                    # Optionally: await __event_emitter__({...})
+                    logger.error(f"Failed to fetch fresh price for {ticker}. Using cached price if available.")
                     if "current_price" in ticker_cache:
                         current_price = ticker_cache["current_price"]["data"]
                         logger.info(f"Using previously cached price for {ticker}.")
                     else:
-                        # No cached price available; use a fallback value or decide how to handle it.
+                        # No cached price available; use a fallback value
+                        logger.warning(f"No cached price available for {ticker}, using defaults")
                         current_price = {
                             "current_price": 0.0,
                             "change": 0.0,
@@ -757,10 +774,25 @@ async def _async_gather_stock_data(
                             pytz.timezone("US/Eastern")
                         ).isoformat(),
                     }
+            
+            # Ensure we have valid price data
+            if current_price is None or not isinstance(current_price, dict):
+                logger.warning(f"Invalid price data for {ticker}, using defaults")
+                current_price = {
+                    "current_price": 0.0,
+                    "change": 0.0,
+                    "change_amount": 0.0,
+                    "high": 0.0,
+                    "low": 0.0,
+                    "open": 0.0,
+                    "previous_close": 0.0,
+                }
+                
             result["current_price"] = current_price
 
         except Exception as e:
             logger.error(f"Error getting current price for {ticker}: {str(e)}")
+            # We already initialized result with valid defaults
 
         try:
             # Get news and process sentiments
@@ -769,28 +801,21 @@ async def _async_gather_stock_data(
                 try:
                     news_items = _get_company_news(client, ticker)
                     if news_items:
-
+                        # Filter out items without titles
+                        news_items = [item for item in news_items if item.get("title")]
+                        
                         effective_summaries = [
                             (
                                 ""
-                                if is_similar(item["title"], item["summary"])
-                                else item["summary"]
+                                if is_similar(item.get("title", ""), item.get("summary", ""))
+                                else item.get("summary", "")
                             )
                             for item in news_items
                         ]
 
-                        # Create sentiment analysis tasks directly using the summary and title
-                        # sentiment_tasks = [
-                        #    _async_sentiment_analysis(effective_summary, item["title"])
-                        #    for effective_summary, item in zip(
-                        #        effective_summaries, news_items
-                        #    )
-                        # ]
-                        # sentiments = await asyncio.gather(*sentiment_tasks)
-
-                        # Wrap the CPU-bound work in a thread
+                        # Create sentiment analysis tasks
                         sentiment_tasks = [
-                            _async_sentiment_analysis(effective_summary, item["title"])
+                            _async_sentiment_analysis(effective_summary, item.get("title", ""))
                             for effective_summary, item in zip(
                                 effective_summaries, news_items
                             )
@@ -799,12 +824,12 @@ async def _async_gather_stock_data(
 
                         sentiment_results = [
                             {
-                                "url": item["url"],
-                                "title": item["title"],
+                                "url": item.get("url", ""),
+                                "title": item.get("title", "No title"),
                                 "summary": effective_summary,
-                                "sentiment": sentiment["sentiment"],
-                                "confidence": sentiment["confidence"],
-                                "probabilities": sentiment["probabilities"],
+                                "sentiment": sentiment.get("sentiment", "neutral"),
+                                "confidence": sentiment.get("confidence", 0.0),
+                                "probabilities": sentiment.get("probabilities", []),
                             }
                             for item, sentiment, effective_summary in zip(
                                 news_items, sentiments, effective_summaries
@@ -823,11 +848,15 @@ async def _async_gather_stock_data(
                     logger.error(
                         f"Error processing news/sentiments for {ticker}: {str(e)}"
                     )
+                    # If we have cached sentiments, use those
+                    if "sentiments" in ticker_cache:
+                        result["sentiments"] = ticker_cache["sentiments"]["data"]
             else:
                 logger.info(f"Using cached sentiments for {ticker}")
                 result["sentiments"] = ticker_cache["sentiments"]["data"]
         except Exception as e:
             logger.error(f"Error in sentiment processing for {ticker}: {str(e)}")
+            # We already initialized result with valid defaults
 
         # Write updated ticker data back to the shared shelve cache
         cache[ticker] = ticker_cache
@@ -1103,33 +1132,63 @@ def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> st
 
 def _compile_report(data: Dict[str, Any]) -> str:
     """
-    Compile gathered data into a concise but comprehensive report.
+    Compile gathered data into a concise but comprehensive report with improved error handling.
+    Ensures no "None (None)" values appear in the output.
     """
     try:
-        profile = data["basic_info"]["profile"]
-        financials = data["basic_info"]["basic_financials"]
+        profile = data.get("basic_info", {}).get("profile", {})
+        financials = data.get("basic_info", {}).get("basic_financials", {})
         metrics = financials.get("metric", {})
-        price_data = data["current_price"]
+        price_data = data.get("current_price", {})
+
+        # Ensure we have a valid ticker and name
+        ticker = profile.get('ticker')
+        name = profile.get('name')
+        
+        # Check if we have minimum required data
+        if not ticker:
+            logger.error("Missing ticker in profile data")
+            ticker = "Unknown"
+        
+        if not name:
+            logger.error(f"Missing name for ticker {ticker}")
+            name = ticker  # Fall back to using ticker as name
 
         def format_with_suffix(num):
-            if num is None or num == 0:
+            """Format large numbers with B/M suffix with proper error handling"""
+            if num is None or num == "N/A" or not isinstance(num, (int, float)) or num == 0:
                 return "N/A"
-            if num >= 1_000_000:
-                return f"{num/1_000_000:.2f}B"
-            elif num >= 1_000:
-                return f"{num/1_000:.2f}M"
-            return f"{num:.2f}"
+            try:
+                if num >= 1_000_000:
+                    return f"{num/1_000_000:.2f}B"
+                elif num >= 1_000:
+                    return f"{num/1_000:.2f}M"
+                return f"{num:.2f}"
+            except (TypeError, ValueError):
+                return "N/A"
 
-        fin_health_score = assess_financial_health(
-            metrics, profile.get("finnhubIndustry", "")
-        )
+        # Safe fetch for market cap
+        market_cap = profile.get('marketCapitalization')
+        if market_cap is not None and isinstance(market_cap, (int, float)):
+            market_cap_display = format_with_suffix(market_cap * 1_000_000)
+        else:
+            market_cap_display = "N/A"
+
+        # Get financial health score with safe handling
+        try:
+            fin_health_score = assess_financial_health(
+                metrics, profile.get('finnhubIndustry', '')
+            )
+        except Exception as e:
+            logger.error(f"Error calculating financial health score: {str(e)}")
+            fin_health_score = "moderate"
 
         # Build report with key metrics and insights
-        report = f"""Stock Analysis: {profile.get('name')} ({profile.get('ticker')})
+        report = f"""Stock Analysis: {name} ({ticker})
 
 Company Overview:
-• {profile.get('finnhubIndustry', 'N/A')} | Market Cap: ${format_with_suffix(profile.get('marketCapitalization', 0) * 1_000_000)} | Country: {profile.get('country', 'N/A')}
-• Current Price: ${safe_format_number(price_data['current_price'])} ({safe_format_number(price_data['change'])}%) | YTD: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
+• {profile.get('finnhubIndustry', 'N/A')} | Market Cap: ${market_cap_display} | Country: {profile.get('country', 'N/A')}
+• Current Price: ${safe_format_number(price_data.get('current_price'))} ({safe_format_number(price_data.get('change'))}%) | YTD: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
 • 52W Range: ${safe_format_number(metrics.get('52WeekLow'))} - ${safe_format_number(metrics.get('52WeekHigh'))} | Beta: {safe_format_number(metrics.get('beta'))}
 
 Key Performance Indicators:
@@ -1147,65 +1206,94 @@ Valuation:
 • Dividend Yield: {safe_format_number(metrics.get('dividendYieldIndicatedAnnual'))}% | Payout Ratio: {safe_format_number(metrics.get('payoutRatioTTM'))}%
 
 Summary Analysis:
-• Health Score: {fin_health_score}
-• Key Strengths: {', '.join([s for s in [
-    'High Growth' if safe_float(metrics.get('revenueGrowth5Y', 0)) > 10 else None,
-    'Strong Margins' if safe_float(metrics.get('netProfitMarginTTM', 0)) > 15 else None,
-    'Solid Returns' if safe_float(metrics.get('roeTTM', 0)) > 15 else None,
-    'Low Leverage' if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) < 0.5 else None
-    ] if s is not None]) or 'None identified'}
-• Key Risks: {', '.join([r for r in [
-    'Negative Growth' if safe_float(metrics.get('revenueGrowth5Y', 0)) < 0 else None,
-    'Low Margins' if safe_float(metrics.get('netProfitMarginTTM', 0)) < 5 else None,
-    'High Leverage' if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) > 2 else None,
-    'High Beta' if safe_float(metrics.get('beta', 0)) > 2 else None
-    ] if r is not None]) or 'None identified'}
+• Health Score: {fin_health_score}"""
 
-Recent News Sentiment:"""
+        # Add key strengths with error handling
+        strengths = []
+        try:
+            if safe_float(metrics.get('revenueGrowth5Y', 0)) > 10:
+                strengths.append('High Growth')
+            if safe_float(metrics.get('netProfitMarginTTM', 0)) > 15:
+                strengths.append('Strong Margins')
+            if safe_float(metrics.get('roeTTM', 0)) > 15:
+                strengths.append('Solid Returns')
+            if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) < 0.5:
+                strengths.append('Low Leverage')
+        except Exception as e:
+            logger.warning(f"Error calculating strengths: {str(e)}")
+        
+        report += f"\n• Key Strengths: {', '.join(strengths) if strengths else 'None identified'}"
 
-        # Add sentiment analysis summary
-        positive_count = sum(
-            1 for item in data["sentiments"] if item["sentiment"] == "positive"
-        )
-        negative_count = sum(
-            1 for item in data["sentiments"] if item["sentiment"] == "negative"
-        )
-        total_count = len(data["sentiments"])
+        # Add key risks with error handling
+        risks = []
+        try:
+            if safe_float(metrics.get('revenueGrowth5Y', 0)) < 0:
+                risks.append('Negative Growth')
+            if safe_float(metrics.get('netProfitMarginTTM', 0)) < 5:
+                risks.append('Low Margins')
+            if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) > 2:
+                risks.append('High Leverage')
+            if safe_float(metrics.get('beta', 0)) > 2:
+                risks.append('High Beta')
+        except Exception as e:
+            logger.warning(f"Error calculating risks: {str(e)}")
+            
+        report += f"\n• Key Risks: {', '.join(risks) if risks else 'None identified'}"
 
-        # Updated sentiment summary logic
-        if total_count > 0:
-            weighted_sentiment = sum(
-                float(item["confidence"])
-                for item in data["sentiments"]
-                if item["sentiment"] == "positive"
+        # Add sentiment analysis summary with error checking
+        sentiments = data.get("sentiments", [])
+        if sentiments:
+            report += "\n\nRecent News Sentiment:"
+            
+            # Calculate positive count safely
+            positive_count = sum(
+                1 for item in sentiments 
+                if isinstance(item, dict) and item.get("sentiment") == "positive"
             )
-            total_confidence = sum(
-                float(item["confidence"]) for item in data["sentiments"]
-            )
-            sentiment_ratio = (
-                weighted_sentiment / total_confidence if total_confidence > 0 else 0.5
-            )
-            overall_sentiment = (
-                "Bullish"
-                if sentiment_ratio > 0.6
-                else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
-            )
+            total_count = len(sentiments)
+
+            # Calculate weighted sentiment safely
+            try:
+                weighted_sentiment = sum(
+                    float(item.get("confidence", 0))
+                    for item in sentiments
+                    if isinstance(item, dict) and item.get("sentiment") == "positive"
+                )
+                total_confidence = sum(
+                    float(item.get("confidence", 0)) 
+                    for item in sentiments 
+                    if isinstance(item, dict)
+                )
+                sentiment_ratio = (
+                    weighted_sentiment / total_confidence if total_confidence > 0 else 0.5
+                )
+                overall_sentiment = (
+                    "Bullish"
+                    if sentiment_ratio > 0.6
+                    else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
+                )
+            except Exception as e:
+                logger.warning(f"Error calculating sentiment: {str(e)}")
+                overall_sentiment = "Neutral"
+
             report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
 
-            # Add all recent news
-            for item in data["sentiments"]:
-                title = item["title"]
-                summary = item["summary"]
-                if summary:
-                    summary_str = f" - {summary}"
-                else:
-                    summary_str = ""
-                report += f"\n• {item['sentiment']} - {title}{summary_str}"
+            # Add news items with error handling
+            for item in sentiments:
+                if not isinstance(item, dict):
+                    continue
+                    
+                sentiment = item.get('sentiment', 'neutral')
+                title = item.get('title', 'No title')
+                summary = item.get('summary', '')
+                
+                summary_str = f" - {summary}" if summary else ""
+                report += f"\n• {sentiment} - {title}{summary_str}"
 
         return report
+        
     except Exception as e:
         import traceback
-
         tb = traceback.extract_tb(e.__traceback__)
         filename, line_no, func_name, text = tb[-1]
         logger.error(
@@ -1213,7 +1301,11 @@ Recent News Sentiment:"""
         )
         logger.error(f"Line content: {text}")
         logger.error(f"Full traceback: {traceback.format_exc()}")
-        raise
+        
+        # Even if we encounter an error, return a basic valid report instead of failing
+        return f"""Stock Analysis: Error generating complete report
+            Error details: Error in {func_name} at line {line_no}: {str(e)}
+            Please check logs for more information."""
 
 
 class Tools:
