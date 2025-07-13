@@ -117,7 +117,7 @@ def _save_cache(cache_file: str, cache_data: Dict[str, Any]) -> None:
 
 
 def _is_cache_valid(
-    cached_data: Dict[str, Any], cache_duration: timedelta = timedelta(hours=5)
+    cached_data: Dict[str, Any], cache_duration: timedelta = timedelta(hours=1)
 ) -> bool:
     """Check if cached data is still valid based on timestamp"""
     if not cached_data or "timestamp" not in cached_data:
@@ -293,8 +293,10 @@ class Tools:
                     )
 
             # Format response with citations
-            response_text = f"{content}\n\nSources:\n"
+            original_prompt = f"Original query: {query}\n\n"
+            response_text = original_prompt + f"{content}\n\nSources:\n"
             response_text += "- Perplexity AI Search\n"
+
             for url in citations:
                 response_text += f"- {url}\n"
 

@@ -1,7 +1,7 @@
 """
 title: Stock Market Helper
 description: A comprehensive stock analysis tool that gathers data from Finnhub API and compiles a detailed report.
-author: Sergii Zabigailo
+author: Serge Z
 author_url: https://github.com/sergezab/
 github: https://github.com/sergezab/openwebui_tools/
 funding_url: https://github.com/open-webui
@@ -11,6 +11,7 @@ requirements: finnhub-python,pytz
 """
 
 import finnhub
+import yfinance as yf  # For Yahoo Finance API
 import requests
 import aiohttp
 import asyncio
@@ -205,7 +206,10 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     Handles failures gracefully by providing default values.
     """
     result = {
-        "profile": {"ticker": ticker, "name": ticker},  # Ensure we always have name and ticker
+        "profile": {
+            "ticker": ticker,
+            "name": ticker,
+        },  # Ensure we always have name and ticker
         "basic_financials": {"metric": {}},  # Empty financials
         "peers": [],  # Empty peers list
     }
@@ -221,10 +225,10 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
                 )
             elif isinstance(profile, dict):
                 # Ensure we have both name and ticker in the profile
-                if not profile.get('ticker'):
-                    profile['ticker'] = ticker
-                if not profile.get('name'):
-                    profile['name'] = ticker
+                if not profile.get("ticker"):
+                    profile["ticker"] = ticker
+                if not profile.get("name"):
+                    profile["name"] = ticker
                 result["profile"] = profile
             else:
                 logger.warning(f"Invalid profile response format for {ticker}")
@@ -645,18 +649,137 @@ def _is_market_hours() -> Tuple[bool, str]:
     return True, "Market is open"
 
 
+def is_etf_or_fund(profile):
+    """
+    Determine if a security is an ETF or money market fund based on its profile.
+
+    Args:
+        profile (dict): The profile data from Finnhub API
+
+    Returns:
+        tuple: (is_etf_or_fund, type_str) where type_str is 'ETF', 'Money Market Fund', etc.
+    """
+    # Check profile data for indicators
+    if not profile:
+        return False, "Unknown"
+
+    # Check name indicators for ETFs and funds
+    name = profile.get("name", "").lower()
+    ticker = profile.get("ticker", "").lower()
+    security_type = profile.get("type", "").lower()
+
+    # Common ETF indicators in name
+    etf_keywords = [
+        "etf",
+        "exchange traded fund",
+        "index fund",
+        "index trust",
+        "shares",
+    ]
+
+    # Common money market fund indicators
+    mmf_keywords = [
+        "money market",
+        "cash reserves",
+        "liquidity fund",
+        "treasury",
+        "govt",
+    ]
+
+    # Check for ETF patterns in name or ticker
+    if any(keyword in name for keyword in etf_keywords) or ticker.endswith("etf"):
+        return True, "ETF"
+
+    # Check for money market fund patterns
+    if any(keyword in name for keyword in mmf_keywords) or ticker.endswith("mm"):
+        return True, "Money Market Fund"
+
+    # Check security type if available
+    if security_type:
+        if "etf" in security_type or "fund" in security_type:
+            return True, "ETF"
+
+    # Additional specific checks for common ETF tickers
+    common_etfs = {
+        "spy",
+        "qqq",
+        "voo",
+        "dia",
+        "iwm",
+        "vti",
+        "gld",
+        "xlf",
+        "xle",
+        "xlu",
+        "vnq",
+        "kweb",
+        "ihi",
+        "ewz",
+        "bnd",
+        "vusxx",
+        "vwo",
+        "botz",
+        "snsxx",
+    }
+    if ticker.lower() in common_etfs:
+        if "snsxx" in ticker.lower():
+            return True, "Money Market Fund"
+        return True, "ETF"
+
+    return False, "Stock"
+
+
+# Add this function to get ETF-specific data when available
+async def _get_etf_data(client, ticker):
+    """
+    Retrieve ETF-specific data that would be more relevant than regular stock metrics.
+
+    Args:
+        client: Finnhub client
+        ticker (str): The ETF ticker
+
+    Returns:
+        dict: ETF-specific data
+    """
+    etf_data = {
+        "expense_ratio": None,
+        "aum": None,  # Assets Under Management
+        "nav": None,  # Net Asset Value
+        "category": None,
+        "top_holdings": [],
+        "asset_allocation": {},
+        "inception_date": None,
+    }
+
+    try:
+        # Try to get ETF profile if available
+        # Note: This would ideally be a specialized Finnhub endpoint for ETFs
+        # Since it's not directly available, we can supplement with custom logic
+        profile = get_company_profile(client, ticker)
+
+        # Parse any available ETF data from profile
+        # Many of these might not be available directly from Finnhub
+
+        return etf_data
+    except Exception as e:
+        logger.warning(f"Could not fetch ETF-specific data for {ticker}: {str(e)}")
+        return etf_data
+
+
 async def _async_gather_stock_data(
     client: finnhub.Client, ticker: str, cache: shelve.Shelf
 ) -> Dict[str, Any]:
     """
     Gather all stock data with improved error handling.
-    Returns minimal valid data structure even if some parts fail.
-    Caches current price if within 2 hours of request or outside trading hours.
+    Enhanced to better handle ETFs and funds.
     """
     # Initialize result with valid default values
     result = {
         "basic_info": {
-            "profile": {"ticker": ticker, "name": ticker},  # Always include name and ticker
+            "profile": {
+                "ticker": ticker,
+                "name": ticker,
+            },
             "basic_financials": {"metric": {}},
             "peers": [],
         },
@@ -670,8 +793,11 @@ async def _async_gather_stock_data(
             "previous_close": 0.0,
         },
         "sentiments": [],
+        "is_etf": False,
+        "fund_type": "Stock",
+        "etf_data": {},
     }
-    
+
     try:
         # Get the ticker's cache data; if not present, start with an empty dict
         ticker_cache = cache.get(ticker, {})
@@ -681,7 +807,7 @@ async def _async_gather_stock_data(
             if not _is_cache_valid(ticker_cache, "basic_info"):
                 logger.info(f"Fetching fresh basic info for {ticker}")
                 basic_info = _get_basic_info(client, ticker)
-                
+
                 # Check if the basic info looks valid (e.g. has a 'name' and 'ticker')
                 profile = basic_info.get("profile", {})
                 if profile.get("name") and profile.get("ticker"):
@@ -702,17 +828,105 @@ async def _async_gather_stock_data(
             else:
                 logger.info(f"Using cached basic info for {ticker}")
                 basic_info = ticker_cache["basic_info"]["data"]
-            
+
             # Ensure result has valid basic info
             if not basic_info.get("profile", {}).get("name"):
-                logger.warning(f"Name missing in profile for {ticker}, using ticker as name")
+                logger.warning(
+                    f"Name missing in profile for {ticker}, using ticker as name"
+                )
                 basic_info.setdefault("profile", {})["name"] = ticker
-            
+
             if not basic_info.get("profile", {}).get("ticker"):
                 logger.warning(f"Ticker missing in profile for {ticker}, adding it")
                 basic_info.setdefault("profile", {})["ticker"] = ticker
-                
+
             result["basic_info"] = basic_info
+
+            # Check if the security is an ETF or fund
+            is_etf, fund_type = is_etf_or_fund(basic_info.get("profile", {}))
+            result["is_etf"] = is_etf
+            result["fund_type"] = fund_type
+
+            # If it's an ETF/fund, try to get additional ETF-specific data
+            if is_etf:
+                logger.info(
+                    f"Detected {fund_type} for {ticker}, fetching specialized data"
+                )
+
+                # Try to get ETF data from cache first
+                if _is_cache_valid(ticker_cache, "etf_data"):
+                    logger.info(f"Using cached ETF data for {ticker}")
+                    result["etf_data"] = ticker_cache["etf_data"]["data"]
+                else:
+                    # Try to supplement with data from yfinance if Finnhub lacks ETF data
+                    try:
+                        # First attempt to get data from Finnhub
+                        etf_data = {}
+
+                        # Supplement with yfinance data if available
+                        try:
+                            logger.info(
+                                f"Attempting to get supplemental ETF data from yfinance for {ticker}"
+                            )
+                            yf_ticker = yf.Ticker(ticker)
+                            yf_info = yf_ticker.info
+
+                            # Extract relevant ETF data
+                            etf_data.update(
+                                {
+                                    "expense_ratio": yf_info.get("expenseRatio"),
+                                    "category": yf_info.get("category"),
+                                    "aum": yf_info.get("totalAssets"),
+                                    "nav": yf_info.get("navPrice"),
+                                    "inception_date": yf_info.get("fundInceptionDate"),
+                                    "yield": yf_info.get("yield"),
+                                    "ytd_return": yf_info.get("ytdReturn"),
+                                    "three_year_return": yf_info.get(
+                                        "threeYearAverageReturn"
+                                    ),
+                                    "five_year_return": yf_info.get(
+                                        "fiveYearAverageReturn"
+                                    ),
+                                }
+                            )
+
+                            # For money market funds, get specific attributes
+                            if fund_type == "Money Market Fund":
+                                etf_data.update(
+                                    {
+                                        "seven_day_yield": yf_info.get("sevenDayYield"),
+                                        "weighted_avg_maturity": yf_info.get(
+                                            "weightedAverageMaturity"
+                                        ),
+                                    }
+                                )
+
+                            # Cache the ETF data
+                            ticker_cache["etf_data"] = {
+                                "data": etf_data,
+                                "timestamp": datetime.now(
+                                    pytz.timezone("US/Eastern")
+                                ).isoformat(),
+                            }
+                            result["etf_data"] = etf_data
+
+                        except Exception as e:
+                            logger.warning(
+                                f"Error getting supplemental ETF data from yfinance: {str(e)}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Error getting ETF-specific data for {ticker}: {str(e)}"
+                        )
+
+                        # Still cache an empty result to avoid repeated failed attempts
+                        ticker_cache["etf_data"] = {
+                            "data": {},
+                            "timestamp": datetime.now(
+                                pytz.timezone("US/Eastern")
+                            ).isoformat(),
+                        }
+
         except Exception as e:
             logger.error(f"Error getting basic info for {ticker}: {str(e)}")
             # We already initialized result with valid defaults
@@ -745,18 +959,64 @@ async def _async_gather_stock_data(
             if use_cached_price:
                 current_price = ticker_cache["current_price"]["data"]
             else:
-                # Get fresh price data
+                # Get fresh price data - try Finnhub first, then fallback methods
                 logger.info(f"Fetching fresh price for {ticker}")
-                current_price = _get_current_price(client, ticker)
+                current_price = None
+
+                # First try Finnhub
+                try:
+                    current_price = _get_current_price(client, ticker)
+                except Exception as e:
+                    logger.warning(f"Error getting price from Finnhub: {str(e)}")
+
+                # If Finnhub fails or returns None, try yfinance as fallback for ETFs
+                if current_price is None and result["is_etf"]:
+                    try:
+                        logger.info(
+                            f"Attempting to get price data from yfinance for {ticker}"
+                        )
+                        yf_ticker = yf.Ticker(ticker)
+                        hist = yf_ticker.history(period="2d")
+
+                        if not hist.empty and len(hist) >= 1:
+                            # Get the most recent data
+                            latest = hist.iloc[-1]
+                            prev = hist.iloc[-2] if len(hist) >= 2 else latest
+
+                            current_price = {
+                                "current_price": float(latest["Close"]),
+                                "change": (
+                                    float((latest["Close"] / prev["Close"] - 1) * 100)
+                                    if prev["Close"] > 0
+                                    else 0.0
+                                ),
+                                "change_amount": float(latest["Close"] - prev["Close"]),
+                                "high": float(latest["High"]),
+                                "low": float(latest["Low"]),
+                                "open": float(latest["Open"]),
+                                "previous_close": float(prev["Close"]),
+                            }
+                            logger.info(
+                                f"Successfully retrieved yfinance price data for {ticker}"
+                            )
+                        else:
+                            logger.warning(f"yfinance returned empty data for {ticker}")
+                    except Exception as e:
+                        logger.warning(f"Error getting yfinance price data: {str(e)}")
+
+                # If still no price data, try previously cached data
                 if current_price is None:
-                    # If the API call failed (e.g. due to rate limit), log and optionally update status.
-                    logger.error(f"Failed to fetch fresh price for {ticker}. Using cached price if available.")
+                    logger.error(
+                        f"Failed to fetch fresh price for {ticker}. Using cached price if available."
+                    )
                     if "current_price" in ticker_cache:
                         current_price = ticker_cache["current_price"]["data"]
                         logger.info(f"Using previously cached price for {ticker}.")
                     else:
                         # No cached price available; use a fallback value
-                        logger.warning(f"No cached price available for {ticker}, using defaults")
+                        logger.warning(
+                            f"No cached price available for {ticker}, using defaults"
+                        )
                         current_price = {
                             "current_price": 0.0,
                             "change": 0.0,
@@ -774,7 +1034,7 @@ async def _async_gather_stock_data(
                             pytz.timezone("US/Eastern")
                         ).isoformat(),
                     }
-            
+
             # Ensure we have valid price data
             if current_price is None or not isinstance(current_price, dict):
                 logger.warning(f"Invalid price data for {ticker}, using defaults")
@@ -787,7 +1047,7 @@ async def _async_gather_stock_data(
                     "open": 0.0,
                     "previous_close": 0.0,
                 }
-                
+
             result["current_price"] = current_price
 
         except Exception as e:
@@ -803,11 +1063,13 @@ async def _async_gather_stock_data(
                     if news_items:
                         # Filter out items without titles
                         news_items = [item for item in news_items if item.get("title")]
-                        
+
                         effective_summaries = [
                             (
                                 ""
-                                if is_similar(item.get("title", ""), item.get("summary", ""))
+                                if is_similar(
+                                    item.get("title", ""), item.get("summary", "")
+                                )
                                 else item.get("summary", "")
                             )
                             for item in news_items
@@ -815,7 +1077,9 @@ async def _async_gather_stock_data(
 
                         # Create sentiment analysis tasks
                         sentiment_tasks = [
-                            _async_sentiment_analysis(effective_summary, item.get("title", ""))
+                            _async_sentiment_analysis(
+                                effective_summary, item.get("title", "")
+                            )
                             for effective_summary, item in zip(
                                 effective_summaries, news_items
                             )
@@ -914,6 +1178,62 @@ def safe_format_market_cap(value):
         return "N/A"
     try:
         return f"{float(value):,.0f}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
+def format_timestamp_to_date(timestamp):
+    """Convert Unix timestamp to formatted date string"""
+    if timestamp is None or timestamp == "N/A":
+        return "N/A"
+
+    try:
+        # Convert to integer if it's a string
+        if isinstance(timestamp, str):
+            timestamp = int(timestamp)
+
+        from datetime import datetime
+
+        date_obj = datetime.fromtimestamp(timestamp)
+        return date_obj.strftime("%B %d, %Y")
+    except (ValueError, TypeError, OverflowError) as e:
+        logger.error(f"Error formatting timestamp {timestamp}: {str(e)}")
+        return "N/A"
+
+
+def format_percentage(value):
+    """Format decimal or percentage value with consistent percentage format"""
+    if value is None or value == "N/A":
+        return "N/A"
+
+    try:
+        value_float = float(value)
+
+        # If value is already in percentage form
+        if abs(value_float) > 1.0:
+            return f"{value_float:.2f}%"
+        else:
+            # Convert from decimal to percentage
+            return f"{value_float * 100:.2f}%"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
+def format_currency(value, include_suffix=True):
+    """Format currency value with appropriate formatting"""
+    if value is None or value == "N/A":
+        return "N/A"
+
+    try:
+        value_float = float(value)
+
+        if include_suffix:
+            if value_float >= 1_000_000_000:
+                return f"${value_float / 1_000_000_000:.2f}B"
+            elif value_float >= 1_000_000:
+                return f"${value_float / 1_000_000:.2f}M"
+
+        return f"${value_float:,.2f}"
     except (ValueError, TypeError):
         return "N/A"
 
@@ -1133,7 +1453,7 @@ def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> st
 def _compile_report(data: Dict[str, Any]) -> str:
     """
     Compile gathered data into a concise but comprehensive report with improved error handling.
-    Ensures no "None (None)" values appear in the output.
+    Handles ETFs and money market funds differently from regular stocks.
     """
     try:
         profile = data.get("basic_info", {}).get("profile", {})
@@ -1142,21 +1462,29 @@ def _compile_report(data: Dict[str, Any]) -> str:
         price_data = data.get("current_price", {})
 
         # Ensure we have a valid ticker and name
-        ticker = profile.get('ticker')
-        name = profile.get('name')
-        
+        ticker = profile.get("ticker")
+        name = profile.get("name")
+
         # Check if we have minimum required data
         if not ticker:
             logger.error("Missing ticker in profile data")
             ticker = "Unknown"
-        
+
         if not name:
             logger.error(f"Missing name for ticker {ticker}")
             name = ticker  # Fall back to using ticker as name
 
+        # Check if this is an ETF or money market fund
+        is_fund, fund_type = is_etf_or_fund(profile)
+
+        # Format functions (unchanged from original)
         def format_with_suffix(num):
-            """Format large numbers with B/M suffix with proper error handling"""
-            if num is None or num == "N/A" or not isinstance(num, (int, float)) or num == 0:
+            if (
+                num is None
+                or num == "N/A"
+                or not isinstance(num, (int, float))
+                or num == 0
+            ):
                 return "N/A"
             try:
                 if num >= 1_000_000:
@@ -1168,23 +1496,123 @@ def _compile_report(data: Dict[str, Any]) -> str:
                 return "N/A"
 
         # Safe fetch for market cap
-        market_cap = profile.get('marketCapitalization')
+        market_cap = profile.get("marketCapitalization")
         if market_cap is not None and isinstance(market_cap, (int, float)):
             market_cap_display = format_with_suffix(market_cap * 1_000_000)
         else:
             market_cap_display = "N/A"
 
-        # Get financial health score with safe handling
-        try:
-            fin_health_score = assess_financial_health(
-                metrics, profile.get('finnhubIndustry', '')
-            )
-        except Exception as e:
-            logger.error(f"Error calculating financial health score: {str(e)}")
-            fin_health_score = "moderate"
+        # Handle different report formats based on security type
+        if is_fund:
+            # Special report format for ETFs and money market funds
+            report = f"""Investment Analysis: {name} ({ticker}) - {fund_type}
 
-        # Build report with key metrics and insights
-        report = f"""Stock Analysis: {name} ({ticker})
+Fund Overview:
+• Type: {fund_type} | Category: {profile.get('finnhubIndustry', 'Investment')}
+• Current Price: ${safe_format_number(price_data.get('current_price'))} ({safe_format_number(price_data.get('change'))}%)
+• Daily Range: ${safe_format_number(price_data.get('low'))} - ${safe_format_number(price_data.get('high'))}
+
+Performance:
+• 1-Day Change: {safe_format_number(price_data.get('change'))}%
+• Previous Close: ${safe_format_number(price_data.get('previous_close'))}
+"""
+
+            # Add fund-specific info if we have it
+            # Currently we don't retrieve this data - would need to add specialized data retrieval
+            if fund_type == "ETF":
+                etf_data = data.get("etf_data", {})
+                report += f"""
+ETF Details:
+• Expense Ratio: {format_percentage(etf_data.get('expense_ratio'))}
+• Yield: {format_percentage(etf_data.get('yield'))}
+• YTD Return: {format_percentage(etf_data.get('ytd_return'))}
+• 3 Year Return: {format_percentage(etf_data.get('three_year_return'))}
+• 5 Year Return: {format_percentage(etf_data.get('five_year_return'))}
+• Assets Under Management: {format_currency(etf_data.get('aum'))}
+• Net Asset Value: {format_currency(etf_data.get('nav'), include_suffix=True)}
+• Inception Date: {format_timestamp_to_date(etf_data.get('inception_date'))}
+
+Note: This is an Exchange Traded Fund (ETF). Detailed financial metrics like P/E ratio, 
+profit margins, and debt ratios don't apply in the same way as individual stocks. 
+ETFs represent a basket of securities and are evaluated differently.
+"""
+            elif fund_type == "Money Market Fund":
+                etf_data = data.get("etf_data", {})
+                report += f"""
+Money Market Fund Details:
+• Yield: {format_percentage(etf_data.get('yield'))}
+• 7-Day Yield: {format_percentage(etf_data.get('seven_day_yield'))}
+• YTD Return: {format_percentage(etf_data.get('ytd_return'))}
+• Weighted Average Maturity: {etf_data.get('weighted_avg_maturity', 'N/A')}
+• Total Net Assets: {format_currency(etf_data.get('aum'))}
+
+Note: This is a Money Market Fund. These funds invest in short-term, high-quality 
+securities and are evaluated by their yield, stability, and liquidity rather than 
+traditional stock metrics.
+"""
+            # Add any news sentiment if available
+            sentiments = data.get("sentiments", [])
+            if sentiments:
+                report += "\n\nRecent News Sentiment:"
+                positive_count = sum(
+                    1
+                    for item in sentiments
+                    if isinstance(item, dict) and item.get("sentiment") == "positive"
+                )
+                total_count = len(sentiments)
+
+                # Calculate sentiment
+                try:
+                    weighted_sentiment = sum(
+                        float(item.get("confidence", 0))
+                        for item in sentiments
+                        if isinstance(item, dict)
+                        and item.get("sentiment") == "positive"
+                    )
+                    total_confidence = sum(
+                        float(item.get("confidence", 0))
+                        for item in sentiments
+                        if isinstance(item, dict)
+                    )
+                    sentiment_ratio = (
+                        weighted_sentiment / total_confidence
+                        if total_confidence > 0
+                        else 0.5
+                    )
+                    overall_sentiment = (
+                        "Bullish"
+                        if sentiment_ratio > 0.6
+                        else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error calculating sentiment: {str(e)}")
+                    overall_sentiment = "Neutral"
+
+                report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
+
+                # Add news items
+                for item in sentiments:
+                    if not isinstance(item, dict):
+                        continue
+                    sentiment = item.get("sentiment", "neutral")
+                    title = item.get("title", "No title")
+                    summary = item.get("summary", "")
+                    summary_str = f" - {summary}" if summary else ""
+                    report += f"\n• {sentiment} - {title}{summary_str}"
+        else:
+            # Original report format for regular stocks
+            # [Original stock report code goes here]
+            # Get financial health score with safe handling
+            try:
+                fin_health_score = assess_financial_health(
+                    metrics, profile.get("finnhubIndustry", "")
+                )
+            except Exception as e:
+                logger.error(f"Error calculating financial health score: {str(e)}")
+                fin_health_score = "moderate"
+
+            # Build report with key metrics and insights
+            report = f"""Stock Analysis: {name} ({ticker})
 
 Company Overview:
 • {profile.get('finnhubIndustry', 'N/A')} | Market Cap: ${market_cap_display} | Country: {profile.get('country', 'N/A')}
@@ -1208,92 +1636,99 @@ Valuation:
 Summary Analysis:
 • Health Score: {fin_health_score}"""
 
-        # Add key strengths with error handling
-        strengths = []
-        try:
-            if safe_float(metrics.get('revenueGrowth5Y', 0)) > 10:
-                strengths.append('High Growth')
-            if safe_float(metrics.get('netProfitMarginTTM', 0)) > 15:
-                strengths.append('Strong Margins')
-            if safe_float(metrics.get('roeTTM', 0)) > 15:
-                strengths.append('Solid Returns')
-            if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) < 0.5:
-                strengths.append('Low Leverage')
-        except Exception as e:
-            logger.warning(f"Error calculating strengths: {str(e)}")
-        
-        report += f"\n• Key Strengths: {', '.join(strengths) if strengths else 'None identified'}"
-
-        # Add key risks with error handling
-        risks = []
-        try:
-            if safe_float(metrics.get('revenueGrowth5Y', 0)) < 0:
-                risks.append('Negative Growth')
-            if safe_float(metrics.get('netProfitMarginTTM', 0)) < 5:
-                risks.append('Low Margins')
-            if safe_float(metrics.get('totalDebt/totalEquityQuarterly', 0)) > 2:
-                risks.append('High Leverage')
-            if safe_float(metrics.get('beta', 0)) > 2:
-                risks.append('High Beta')
-        except Exception as e:
-            logger.warning(f"Error calculating risks: {str(e)}")
-            
-        report += f"\n• Key Risks: {', '.join(risks) if risks else 'None identified'}"
-
-        # Add sentiment analysis summary with error checking
-        sentiments = data.get("sentiments", [])
-        if sentiments:
-            report += "\n\nRecent News Sentiment:"
-            
-            # Calculate positive count safely
-            positive_count = sum(
-                1 for item in sentiments 
-                if isinstance(item, dict) and item.get("sentiment") == "positive"
-            )
-            total_count = len(sentiments)
-
-            # Calculate weighted sentiment safely
+            # Add key strengths with error handling
+            strengths = []
             try:
-                weighted_sentiment = sum(
-                    float(item.get("confidence", 0))
+                if safe_float(metrics.get("revenueGrowth5Y", 0)) > 10:
+                    strengths.append("High Growth")
+                if safe_float(metrics.get("netProfitMarginTTM", 0)) > 15:
+                    strengths.append("Strong Margins")
+                if safe_float(metrics.get("roeTTM", 0)) > 15:
+                    strengths.append("Solid Returns")
+                if safe_float(metrics.get("totalDebt/totalEquityQuarterly", 0)) < 0.5:
+                    strengths.append("Low Leverage")
+            except Exception as e:
+                logger.warning(f"Error calculating strengths: {str(e)}")
+
+            report += f"\n• Key Strengths: {', '.join(strengths) if strengths else 'None identified'}"
+
+            # Add key risks with error handling
+            risks = []
+            try:
+                if safe_float(metrics.get("revenueGrowth5Y", 0)) < 0:
+                    risks.append("Negative Growth")
+                if safe_float(metrics.get("netProfitMarginTTM", 0)) < 5:
+                    risks.append("Low Margins")
+                if safe_float(metrics.get("totalDebt/totalEquityQuarterly", 0)) > 2:
+                    risks.append("High Leverage")
+                if safe_float(metrics.get("beta", 0)) > 2:
+                    risks.append("High Beta")
+            except Exception as e:
+                logger.warning(f"Error calculating risks: {str(e)}")
+
+            report += (
+                f"\n• Key Risks: {', '.join(risks) if risks else 'None identified'}"
+            )
+
+            # Add sentiment analysis summary with error checking
+            sentiments = data.get("sentiments", [])
+            if sentiments:
+                report += "\n\nRecent News Sentiment:"
+
+                # Calculate positive count safely
+                positive_count = sum(
+                    1
                     for item in sentiments
                     if isinstance(item, dict) and item.get("sentiment") == "positive"
                 )
-                total_confidence = sum(
-                    float(item.get("confidence", 0)) 
-                    for item in sentiments 
-                    if isinstance(item, dict)
-                )
-                sentiment_ratio = (
-                    weighted_sentiment / total_confidence if total_confidence > 0 else 0.5
-                )
-                overall_sentiment = (
-                    "Bullish"
-                    if sentiment_ratio > 0.6
-                    else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
-                )
-            except Exception as e:
-                logger.warning(f"Error calculating sentiment: {str(e)}")
-                overall_sentiment = "Neutral"
+                total_count = len(sentiments)
 
-            report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
+                # Calculate weighted sentiment safely
+                try:
+                    weighted_sentiment = sum(
+                        float(item.get("confidence", 0))
+                        for item in sentiments
+                        if isinstance(item, dict)
+                        and item.get("sentiment") == "positive"
+                    )
+                    total_confidence = sum(
+                        float(item.get("confidence", 0))
+                        for item in sentiments
+                        if isinstance(item, dict)
+                    )
+                    sentiment_ratio = (
+                        weighted_sentiment / total_confidence
+                        if total_confidence > 0
+                        else 0.5
+                    )
+                    overall_sentiment = (
+                        "Bullish"
+                        if sentiment_ratio > 0.6
+                        else "Bearish" if sentiment_ratio < 0.4 else "Neutral"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error calculating sentiment: {str(e)}")
+                    overall_sentiment = "Neutral"
 
-            # Add news items with error handling
-            for item in sentiments:
-                if not isinstance(item, dict):
-                    continue
-                    
-                sentiment = item.get('sentiment', 'neutral')
-                title = item.get('title', 'No title')
-                summary = item.get('summary', '')
-                
-                summary_str = f" - {summary}" if summary else ""
-                report += f"\n• {sentiment} - {title}{summary_str}"
+                report += f"\n• Overall: {overall_sentiment} ({positive_count}/{total_count} positive)"
+
+                # Add news items with error handling
+                for item in sentiments:
+                    if not isinstance(item, dict):
+                        continue
+
+                    sentiment = item.get("sentiment", "neutral")
+                    title = item.get("title", "No title")
+                    summary = item.get("summary", "")
+
+                    summary_str = f" - {summary}" if summary else ""
+                    report += f"\n• {sentiment} - {title}{summary_str}"
 
         return report
-        
+
     except Exception as e:
         import traceback
+
         tb = traceback.extract_tb(e.__traceback__)
         filename, line_no, func_name, text = tb[-1]
         logger.error(
@@ -1301,7 +1736,7 @@ Summary Analysis:
         )
         logger.error(f"Line content: {text}")
         logger.error(f"Full traceback: {traceback.format_exc()}")
-        
+
         # Even if we encounter an error, return a basic valid report instead of failing
         return f"""Stock Analysis: Error generating complete report
             Error details: Error in {func_name} at line {line_no}: {str(e)}
