@@ -3,13 +3,16 @@ title: Youtube Transcript Provider (Fixed Implementation)
 author: Serge Z
 author_url: https://github.com/sergezab/youtube-transcript-provider
 funding_url: https://github.com/open-webui
-version: 0.0.5
+version: 0.1.5
 """
 
 from typing import Awaitable, Callable, Any
 import traceback
 import time
 import xml.etree.ElementTree
+import os
+import json
+from datetime import datetime, timedelta
 
 # Try to use youtube_transcript_api directly instead of langchain
 try:
@@ -24,10 +27,52 @@ try:
 except ImportError:
     YOUTUBE_TRANSCRIPT_API_AVAILABLE = False
 
+class TranscriptSnippet:
+    def __init__(self, text, start, duration):
+        self.text = text
+        self.start = start
+        self.duration = duration
 
 class Tools:
     def __init__(self):
         self.citation = True
+        self.cache_file = os.path.join(os.path.dirname(__file__), "youtube_transcript_cache.json")
+        self.cache = self._load_cache()
+
+    def _load_cache(self):
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "r") as f:
+                    cache = json.load(f)
+                
+                valid_cache = {
+                    video_id: data for video_id, data in cache.items() if self._is_cache_valid(data)
+                }
+
+                if len(valid_cache) < len(cache):
+                    self._save_cache(valid_cache)
+                
+                return valid_cache
+            except (json.JSONDecodeError, IOError):
+                return {}
+        return {}
+
+    def _save_cache(self, cache_data):
+        try:
+            with open(self.cache_file, "w") as f:
+                json.dump(cache_data, f)
+        except IOError:
+            pass
+
+    def _is_cache_valid(self, cached_data: dict, cache_duration: timedelta = timedelta(days=7)) -> bool:
+        if "timestamp" not in cached_data:
+            return False
+        
+        try:
+            cache_time = datetime.fromisoformat(cached_data["timestamp"])
+            return datetime.now() - cache_time <= cache_duration
+        except (ValueError, TypeError):
+            return False
 
     def _extract_video_id(self, url: str) -> str:
         """Extract video ID from various YouTube URL formats"""
@@ -53,6 +98,9 @@ class Tools:
         self, video_id: str, max_retries: int = 3
     ) -> tuple:
         """Get transcript with retry logic to handle temporary XML parsing errors"""
+
+        if video_id in self.cache and self._is_cache_valid(self.cache[video_id]):
+            return self.cache[video_id]["data"], None
 
         for attempt in range(max_retries):
             try:
@@ -92,7 +140,21 @@ class Tools:
                 # Fetch transcript data with error handling
                 try:
                     transcript_data = transcript.fetch()
-                    return transcript_data, None
+                    # Convert to a serializable format (list of dicts)
+                    serializable_transcript = [
+                        {
+                            "text": item['text'] if isinstance(item, dict) else item.text,
+                            "start": item['start'] if isinstance(item, dict) else item.start,
+                            "duration": item['duration'] if isinstance(item, dict) else item.duration,
+                        }
+                        for item in transcript_data
+                    ]
+                    self.cache[video_id] = {
+                        "timestamp": datetime.now().isoformat(),
+                        "data": serializable_transcript,
+                    }
+                    self._save_cache(self.cache)
+                    return [TranscriptSnippet(**item) for item in serializable_transcript], None
                 except xml.etree.ElementTree.ParseError as e:
                     if attempt < max_retries - 1:
                         # Wait before retry
@@ -191,18 +253,41 @@ class Tools:
                 )
                 return f"The tool failed with an error. Invalid video ID format: {video_id}"
 
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Fetching transcript for video ID: {video_id}",
-                        "done": False,
-                    },
-                }
-            )
+            # Check cache first
+            cached = False
+            if video_id in self.cache and self._is_cache_valid(self.cache[video_id]):
+                cached = True
+                
+                # Update timestamp to extend cache
+                self.cache[video_id]["timestamp"] = datetime.now().isoformat()
+                self._save_cache(self.cache)
 
-            # Get transcript with retry logic
-            transcript_data, error_msg = await self._get_transcript_with_retry(video_id)
+                cache_time = datetime.fromisoformat(self.cache[video_id]["timestamp"])
+                expires_at = cache_time + timedelta(days=7)
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Fetching cached transcript for video ID: {video_id} (expires {expires_at.strftime('%Y-%m-%d %H:%M:%S')})",
+                            "done": False,
+                        },
+                    }
+                )
+                # Convert cached data back to objects
+                transcript_data = [TranscriptSnippet(**item) for item in self.cache[video_id]["data"]]
+                error_msg = None
+            else:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Fetching transcript for video ID: {video_id}",
+                            "done": False,
+                        },
+                    }
+                )
+                # Get transcript with retry logic
+                transcript_data, error_msg = await self._get_transcript_with_retry(video_id)
 
             if transcript_data is None:
                 await __event_emitter__(
@@ -225,16 +310,32 @@ class Tools:
                 if not transcript_text or len(transcript_text.strip()) == 0:
                     raise ValueError("Empty transcript received")
 
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Successfully retrieved transcript for {url}",
-                            "done": True,
-                        },
-                    }
-                )
-                return f"Transcript for {url}: \n\n{transcript_text}"
+                if cached:
+                    cache_time = datetime.fromisoformat(self.cache[video_id]["timestamp"])
+                    expires_at = cache_time + timedelta(days=7)
+                    status_msg = f"Transcript for {url} (from cache, expires {expires_at.strftime('%Y-%m-%d')}): \n\n{transcript_text}"
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Successfully retrieved transcript for {url} from cache.",
+                                "done": True,
+                            },
+                        }
+                    )
+                else:
+                    status_msg = f"Transcript for {url} (freshly retrieved and cached for 7 days): \n\n{transcript_text}"
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Successfully retrieved transcript for {url}",
+                                "done": True,
+                            },
+                        }
+                    )
+                
+                return status_msg
 
             except Exception as e:
                 await __event_emitter__(
