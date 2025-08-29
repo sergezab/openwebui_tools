@@ -1,7 +1,7 @@
 """
 title: Stock Market Helper
 description: A comprehensive stock analysis tool that gathers data from Finnhub API and compiles a detailed report.
-author: Serge Z
+author: Sergii Zabigailo
 author_url: https://github.com/sergezab/
 github: https://github.com/sergezab/openwebui_tools/
 funding_url: https://github.com/open-webui
