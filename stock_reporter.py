@@ -1988,13 +1988,13 @@ def _fund_line(profile: dict, price_data: dict, sentiments: list, etf_data: dict
     ticker = profile.get("ticker", "UNK")
     name = profile.get("name", "")
     px     = _fmt_num(price_data.get("current_price"))
-    dchg_p = _fmt_num(price_data.get("change"))
+    dchg_p = _fmt_num(price_data.get("change")) or "0"
     er_p, yld_p, ytd_p, nav, aum_m = _etf_nums_from_yf(etf_data)  # make aum in millions
     cat    = _short_cat_from_name(name) or _short_cat_fallback(profile)
     news   = _sentiment_score(sentiments)
     hlth   = "0.5"  # or a smarter rule if you add one later
 
-    # F|tkr|px|dchg_p|er_p|yld_p|ytd_p|cat|nav|aum_m|news_01|hlth_01
+    # F|ticker|price_usd|chg_day_pct|exp_ratio_pct|yield_pct|ytd_pct|category|nav_usd|aum_millions|news_score_0to1|health_score_0to1
     fields = ["F", ticker, px, dchg_p, er_p, yld_p, ytd_p, cat, nav, aum_m, news, hlth]
     return "|".join(fields)
 
@@ -2016,7 +2016,7 @@ def _stock_line(profile: dict, metrics: dict, price_data: dict, sentiments: list
         fin_health_str = "moderate"
     hlth   = _health_score_from_text(fin_health_str)   # 0..1 as string
 
-    # S|tkr|px|dchg_p|pe_r|roe_p|npm_p|rev5y_p|de_r|beta|news_01|hlth_01
+    # S|ticker|price_usd|chg_day_pct|pe_ratio|roe_pct|npm_pct|rev5y_pct|de_ratio|beta|news_score_0to1|health_score_0to1
     fields = ["S", ticker, px, dchg_p, pe_r, roe_p, npm_p, rev5y_p, de_r, beta, news, hlth]
     return "|".join(fields)
 
@@ -2026,8 +2026,9 @@ def _compile_report_llm_focused(data: Dict[str, Any]) -> str:
     Compact output for LLMs with separate schemas for Stocks (S) and Funds (F).
     No 'N/A' – blank fields when missing.
     SCHEMA:
-      S:tkr,px,chg,pe,roe,npm,g5y,de,beta,news,hlth
-      F:tkr,px,chg,er,yld,ytd,cat,nav,aum,news,hlth
+        S = Stock: ticker|price_usd|chg_day_pct|pe_ratio|roe_pct|npm_pct|rev5y_pct|de_ratio|beta|news_score_0to1|health_score_0to1
+        F = Fund/ETF: ticker|price_usd|chg_day_pct|exp_ratio_pct|yield_pct|ytd_pct|category|nav_usd|aum_millions|news_score_0to1|health_score_0to1
+        * "_0to1" fields are normalized scores: 0.0=low, 0.5=neutral, 1.0=high.
     """
     try:
         profile = data.get("basic_info", {}).get("profile", {}) or {}
@@ -2240,8 +2241,9 @@ class Tools:
                 if format_type == "compact":
                     # Detailed schema with value ranges and meanings
                     schema_header = (
-                        "SCHEMA S:tkr,px,dchg_p,pe_r,roe_p,npm_p,rev5y_p,de_r,beta,news_01,hlth_01 | "
-                        "F:tkr,px,dchg_p,er_p,yld_p,ytd_p,cat,nav,aum_m,news_01,hlth_01  # _p=%,_r=ratio,_01=[0..1]"
+                        "SCHEMA: S = Stock: ticker|price_usd|chg_day_pct|pe_ratio|roe_pct|npm_pct|rev5y_pct|de_ratio|beta|news_score_0to1|health_score_0to1 \n"
+                        "F = Fund/ETF: ticker|price_usd|chg_day_pct|exp_ratio_pct|yield_pct|ytd_pct|category|nav_usd|aum_millions|news_score_0to1|health_score_0to1 \n"
+                        "* '_0to1' fields are normalized scores: 0.0=low, 0.5=neutral, 1.0=high. \n"
                 )
                     return f"{schema_header}\n{combined_report}"
                 else:
