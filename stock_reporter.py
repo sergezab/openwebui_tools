@@ -218,6 +218,10 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
         # Try to get profile
         try:
             profile = get_company_profile(client, ticker)
+            
+            #Enable for debugging
+            #logger.info(f"Raw profile data for {ticker}: {json.dumps(profile, indent=2)}")
+            
             # Check if the response is valid JSON (not HTML)
             if is_html_response(profile):
                 logger.warning(
@@ -267,27 +271,52 @@ def _get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
         logger.error(f"Critical error in _get_basic_info for {ticker}: {str(e)}")
         return result  # Return default structure even on critical error
 
-
-def _get_current_price(client: finnhub.Client, ticker: str) -> Dict[str, float]:
-    """
-    Fetch current price and daily change from Finnhub API.
-    Returns default values if API call fails.
-    """
+def _get_current_price(client: finnhub.Client, ticker: str) -> Optional[Dict[str, Union[float, str]]]:
     try:
         quote = client.quote(ticker)
+        
+        #Enable for debugging
+        #logger.info(f"Raw quote data for {ticker}: {json.dumps(quote, indent=2)}")
+        
+        current_price = quote.get("c", 0)
+        daily_percent = quote.get("dp", 0) 
+        previous_close = quote.get("pc", 0)
+        
+        # DETECT SUSPICIOUS DATA - likely delisted stock
+        is_suspicious = (
+            abs(daily_percent) > 1000 or  # Extreme percentage change
+            previous_close < 0.10 or      # Previous close under 10 cents
+            current_price > previous_close * 50  # Current price 50x+ previous close
+        )
+        
+        if is_suspicious:
+            logger.warning(f"Suspicious price data for {ticker} - likely delisted/stale data")
+            logger.warning(f"  Current: ${current_price}, Previous: ${previous_close}, Change: {daily_percent}%")
+            
+            # Return data but mark the change as unreliable
+            return {
+                "current_price": current_price,
+                "change": 0.0,  # Set to 0 instead of the bogus percentage
+                "change_amount": 0.0,
+                "high": quote.get("h", 0),
+                "low": quote.get("l", 0), 
+                "open": quote.get("o", 0),
+                "previous_close": previous_close,
+                "data_warning": "Potentially stale/delisted"
+            }
+        
         return {
-            "current_price": quote["c"],
-            "change": quote["dp"],
-            "change_amount": quote["d"],
-            "high": quote["h"],
-            "low": quote["l"],
-            "open": quote["o"],
-            "previous_close": quote["pc"],
+            "current_price": current_price,
+            "change": daily_percent,
+            "change_amount": quote.get("d", 0),
+            "high": quote.get("h", 0),
+            "low": quote.get("l", 0),
+            "open": quote.get("o", 0),
+            "previous_close": previous_close,
         }
     except Exception as e:
         logger.error(f"Error fetching current price for {ticker}: {str(e)}")
         return None
-
 
 class NewsItem(TypedDict):
     url: str
@@ -354,7 +383,7 @@ async def _async_web_scrape(session: aiohttp.ClientSession, url: str) -> str:
 # Asynchronous sentiment analysis
 async def _async_sentiment_analysis(
     summary: str, title: str
-) -> Dict[str, Union[str, float]]:
+) -> Dict[str, Union[str, float, List[List[float]]]]:
     """
     Perform sentiment analysis on text content with improved title-based validation.
     Returns neutral sentiment with 0 confidence if analysis fails.
@@ -458,9 +487,7 @@ async def _async_sentiment_analysis(
             base_sentiment = "Neutral"
             base_confidence = 0.5
 
-        logger.info(
-            f"Keyword-based sentiment: {base_sentiment} (confidence: {base_confidence})"
-        )
+        #logger.info(f"Keyword-based sentiment: {base_sentiment} (confidence: {base_confidence})")
 
         # Perform model-based sentiment analysis on the combined text
         inputs = tokenizer(
@@ -491,13 +518,11 @@ async def _async_sentiment_analysis(
             sentiments = ["Neutral", "Positive", "Negative"]
             model_sentiment = sentiments[sentiment_scores.index(max(sentiment_scores))]
 
-        logger.info(f"Combined text: {combined_text}")
+        #logger.info(f"Combined text: {combined_text}")
         # logger.info(f"Logits: {outputs.logits.tolist()}")
         # logger.info(f"Scaled logits: {scaled_logits.tolist()}")
         # logger.info(f"Probabilities: {sentiment_scores}")
-        logger.info(
-            f"Model sentiment: {model_sentiment} (confidence: {model_confidence})"
-        )
+        #logger.info(f"Model sentiment: {model_sentiment} (confidence: {model_confidence})")
 
         # Combine the two sentiment evaluations
         if base_sentiment == model_sentiment:
@@ -534,6 +559,7 @@ async def _async_sentiment_analysis(
 
 def _is_cache_valid(cached_data: Dict[str, Any], data_type: str) -> bool:
     """Check if cached data is from today"""
+
     if not cached_data or data_type not in cached_data:
         return False
     try:
@@ -1254,7 +1280,7 @@ def dict_to_markdown(d: Dict[str, Any], indent: int = 0) -> str:
     return markdown
 
 
-def interpret_current_ratio(ratio: float, industry: str = None) -> str:
+def interpret_current_ratio(ratio: Optional[float], industry: Optional[str] = None) -> str:
     """
     Interpret current ratio with industry context
     """
@@ -1291,7 +1317,7 @@ def interpret_current_ratio(ratio: float, industry: str = None) -> str:
         return "No data available"
 
 
-def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> str:
+def assess_financial_health(metrics: Dict[str, Any], industry: Optional[str] = None) -> str:
     try:
         # Normalize industry string
         industry = industry.lower() if industry else ""
@@ -1364,7 +1390,7 @@ def assess_financial_health(metrics: Dict[str, Any], industry: str = None) -> st
         }
 
         # Get appropriate thresholds
-        industry_thresholds = thresholds.get(industry_type, thresholds["default"])
+        industry_thresholds = thresholds.get(industry_type or "default", thresholds["default"])
 
         points = 0
         max_points = 0
@@ -1487,16 +1513,25 @@ def _compile_report(data: Dict[str, Any]) -> str:
             ):
                 return "N/A"
             try:
-                if num >= 1_000_000:
-                    return f"{num/1_000_000:.2f}B"
+                # Handle trillions
+                if num >= 1_000_000_000_000:
+                    return f"{num/1_000_000_000_000:.2f}T"
+                # Handle billions
+                elif num >= 1_000_000_000:
+                    return f"{num/1_000_000_000:.2f}B"
+                # Handle millions
+                elif num >= 1_000_000:
+                    return f"{num/1_000_000:.2f}M"
+                # Handle thousands
                 elif num >= 1_000:
-                    return f"{num/1_000:.2f}M"
+                    return f"{num/1_000:.2f}K"
                 return f"{num:.2f}"
             except (TypeError, ValueError):
                 return "N/A"
 
         # Safe fetch for market cap
         market_cap = profile.get("marketCapitalization")
+
         if market_cap is not None and isinstance(market_cap, (int, float)):
             market_cap_display = format_with_suffix(market_cap * 1_000_000)
         else:
@@ -1776,7 +1811,7 @@ class Tools:
         self,
         ticker: str,
         __user__: dict = {},
-        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Perform a comprehensive stock analysis and compile a detailed report for given ticker(s).
@@ -1802,12 +1837,13 @@ class Tools:
             ticker_query = ticker_str
 
             # Initialize the Finnhub client
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {"description": "Initializing client", "done": False},
-                }
-            )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": "Initializing client", "done": False},
+                    }
+                )
             self.client = finnhub.Client(api_key=self.valves.FINNHUB_API_KEY)
 
             # Open the shelve cache
@@ -1830,15 +1866,16 @@ class Tools:
                     )
 
                     if idx % 4 == 0 or idx == len(tickers) - 1:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(tickers)})",
-                                    "done": False,
-                                },
-                            }
-                        )
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(tickers)})",
+                                        "done": False,
+                                    },
+                                }
+                            )
 
                     # Pass the shared shelve cache to the data gathering function
                     data = await _async_gather_stock_data(
@@ -1855,15 +1892,16 @@ class Tools:
                     combined_report += report
 
                     if idx == len(tickers) - 1:
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"Finished report for {single_ticker} - latest price: {str(last_price)}",
-                                    "done": idx == len(tickers) - 1,
-                                },
-                            }
-                        )
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": f"Finished report for {single_ticker} - latest price: {str(last_price)}",
+                                        "done": idx == len(tickers) - 1,
+                                    },
+                                }
+                            )
 
                 logger.info("Successfully completed stock report compilation")
                 return f"Tickers {tickers}\n\n Combined Report:\n{combined_report}"
