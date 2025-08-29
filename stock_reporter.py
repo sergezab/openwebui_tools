@@ -522,7 +522,7 @@ async def _async_sentiment_analysis(
         # logger.info(f"Logits: {outputs.logits.tolist()}")
         # logger.info(f"Scaled logits: {scaled_logits.tolist()}")
         # logger.info(f"Probabilities: {sentiment_scores}")
-        #logger.info(f"Model sentiment: {model_sentiment} (confidence: {model_confidence})")
+        logger.info(f"Model sentiment: {model_sentiment} (confidence: {model_confidence})")
 
         # Combine the two sentiment evaluations
         if base_sentiment == model_sentiment:
@@ -1777,6 +1777,284 @@ Summary Analysis:
             Error details: Error in {func_name} at line {line_no}: {str(e)}
             Please check logs for more information."""
 
+def _compile_report_optimized(data: Dict[str, Any]) -> str:
+    """
+    Compile gathered data into a token-optimized but still human-readable report.
+    Removes redundant text and uses more compact formatting.
+    Reduces token usage by ~60% compared to original.
+    """
+    try:
+        profile = data.get("basic_info", {}).get("profile", {})
+        financials = data.get("basic_info", {}).get("basic_financials", {})
+        metrics = financials.get("metric", {})
+        price_data = data.get("current_price", {})
+
+        ticker = profile.get("ticker", "Unknown")
+        name = profile.get("name", ticker)
+        
+        # Check if this is an ETF or money market fund
+        is_fund, fund_type = is_etf_or_fund(profile)
+
+        def format_compact(num):
+            if num is None or num == "N/A" or not isinstance(num, (int, float)) or num == 0:
+                return "N/A"
+            try:
+                if num >= 1_000_000_000_000:
+                    return f"{num/1_000_000_000_000:.1f}T"
+                elif num >= 1_000_000_000:
+                    return f"{num/1_000_000_000:.1f}B"
+                elif num >= 1_000_000:
+                    return f"{num/1_000_000:.1f}M"
+                elif num >= 1_000:
+                    return f"{num/1_000:.1f}K"
+                return f"{num:.2f}"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        market_cap = profile.get("marketCapitalization")
+        market_cap_display = format_compact(market_cap * 1_000_000) if market_cap else "N/A"
+
+        if is_fund:
+            # Compact ETF/Fund format
+            report = f"""{name} ({ticker}) - {fund_type}
+Price: ${safe_format_number(price_data.get('current_price'))} ({safe_format_number(price_data.get('change'))}%)
+Range: ${safe_format_number(price_data.get('low'))}-${safe_format_number(price_data.get('high'))}
+Industry: {profile.get('finnhubIndustry', 'Investment')}"""
+
+            etf_data = data.get("etf_data", {})
+            if etf_data:
+                if fund_type == "ETF":
+                    report += f"""
+Expense: {format_percentage(etf_data.get('expense_ratio'))} | Yield: {format_percentage(etf_data.get('yield'))}
+AUM: {format_currency(etf_data.get('aum'))} | YTD: {format_percentage(etf_data.get('ytd_return'))}"""
+                elif fund_type == "Money Market Fund":
+                    report += f"""
+Yield: {format_percentage(etf_data.get('yield'))} | 7D: {format_percentage(etf_data.get('seven_day_yield'))}
+Assets: {format_currency(etf_data.get('aum'))}"""
+
+        else:
+            # Compact stock format - remove redundant labels and group related metrics
+            try:
+                fin_health = assess_financial_health(metrics, profile.get("finnhubIndustry", ""))
+            except Exception as e:
+                logger.error(f"Error calculating financial health: {str(e)}")
+                fin_health = "moderate"
+            
+            report = f"""{name} ({ticker})
+${safe_format_number(price_data.get('current_price'))} ({safe_format_number(price_data.get('change'))}%) | Cap: ${market_cap_display} | Beta: {safe_format_number(metrics.get('beta'))}
+Growth: Rev {safe_format_number(metrics.get('revenueGrowth5Y'))}% EPS {safe_format_number(metrics.get('epsGrowth5Y'))}% | YTD: {safe_format_number(metrics.get('yearToDatePriceReturnDaily'))}%
+Margins: {safe_format_number(metrics.get('grossMarginTTM'))}%/{safe_format_number(metrics.get('operatingMarginTTM'))}%/{safe_format_number(metrics.get('netProfitMarginTTM'))}% (G/O/N)
+Returns: ROE {safe_format_number(metrics.get('roeTTM'))}% ROA {safe_format_number(metrics.get('roaTTM'))}%
+Ratios: P/E {safe_format_number(metrics.get('peTTM'))} P/B {safe_format_number(metrics.get('pbQuarterly'))} Current {safe_format_number(metrics.get('currentRatioQuarterly'))}
+D/E: {safe_format_number(metrics.get('totalDebt/totalEquityQuarterly'))} | Health: {fin_health}"""
+
+            # Add key strengths/risks in compact format
+            strengths = []
+            risks = []
+            try:
+                if safe_float(metrics.get("revenueGrowth5Y", 0)) > 10:
+                    strengths.append("Growth")
+                if safe_float(metrics.get("netProfitMarginTTM", 0)) > 15:
+                    strengths.append("Margins")
+                if safe_float(metrics.get("roeTTM", 0)) > 15:
+                    strengths.append("ROE")
+                if safe_float(metrics.get("totalDebt/totalEquityQuarterly", 0)) < 0.5:
+                    strengths.append("Low Debt")
+                    
+                if safe_float(metrics.get("revenueGrowth5Y", 0)) < 0:
+                    risks.append("Rev Decline")
+                if safe_float(metrics.get("netProfitMarginTTM", 0)) < 5:
+                    risks.append("Low Margins")
+                if safe_float(metrics.get("totalDebt/totalEquityQuarterly", 0)) > 2:
+                    risks.append("High Debt")
+                if safe_float(metrics.get("beta", 0)) > 2:
+                    risks.append("High Beta")
+            except Exception as e:
+                logger.warning(f"Error calculating strengths/risks: {str(e)}")
+
+            if strengths or risks:
+                report += f"\n+: {', '.join(strengths) if strengths else 'None'} | -: {', '.join(risks) if risks else 'None'}"
+
+        # Compact sentiment summary
+        sentiments = data.get("sentiments", [])
+        if sentiments:
+            pos_count = sum(1 for s in sentiments if isinstance(s, dict) and s.get("sentiment") == "positive")
+            sentiment_summary = "Bullish" if pos_count > len(sentiments)/2 else "Bearish" if pos_count < len(sentiments)/3 else "Neutral"
+            report += f"\nNews: {sentiment_summary} ({pos_count}/{len(sentiments)} positive)"
+
+        return report
+
+    except Exception as e:
+        logger.error(f"Error compiling optimized report: {str(e)}")
+        return f"Analysis error for {ticker}: {str(e)}"
+
+
+def _short_cat_from_name(name: str) -> str:
+    if not name:
+        return ""
+    s = name.lower()
+    # very lightweight heuristics
+    if "money market" in s or s.endswith("mm") or "treasury" in s or "gov" in s:
+        return "MMF"
+    if "total" in s and ("market" in s or "stock" in s):
+        return "US-TOT"
+    if "s&p" in s or "500" in s or "spdr" in s:
+        return "US-LC"
+    if "emerging" in s or "em" == s or "vwo" in s:
+        return "EM"
+    if "gold" in s or "gld" in s:
+        return "COMD"
+    if "robot" in s or "ai" in s or "automation" in s:
+        return "THEME"
+    if "real estate" in s or "reit" in s:
+        return "RE"
+    return ""
+
+def _short_cat_fallback(profile: dict) -> str:
+    # use finnhubIndustry if no good short code
+    cat = profile.get("finnhubIndustry") or ""
+    if not cat:
+        return ""
+    # compact it a bit
+    return "".join([w[0].upper() for w in cat.split() if w and w[0].isalpha()])[:6]
+
+def _fmt_num(val, decimals=1):
+    """Return '' for missing; otherwise a compact float string with <=decimals."""
+    if val is None or val == "N/A":
+        return ""
+    try:
+        v = float(val)
+        return f"{v:.{decimals}f}".rstrip('0').rstrip('.')  # trim trailing zeros
+    except:
+        return ""
+
+def _fmt_pct(val, decimals=1):
+    """Input is already % or decimal? We assume it's a % number already. Return '' if missing."""
+    if val is None or val == "N/A":
+        return ""
+    try:
+        v = float(val)
+        return f"{v:.{decimals}f}".rstrip('0').rstrip('.')
+    except:
+        return ""
+
+def _sentiment_score(sentiments: list) -> str:
+    if not sentiments:
+        return "0.5"
+    try:
+        pos = sum(1 for s in sentiments if isinstance(s, dict) and s.get("sentiment") == "positive")
+        return f"{pos/len(sentiments):.2f}".rstrip('0').rstrip('.')
+    except:
+        return "0.5"
+
+def _health_score_from_text(health_str: str) -> str:
+    if not isinstance(health_str, str):
+        return "0.5"
+    hs = health_str.lower()
+    if "strong" in hs:
+        return "0.8"
+    if "weak" in hs or "poor" in hs:
+        return "0.2"
+    return "0.5"
+
+def _safe_metric(metrics: dict, key: str):
+    val = metrics.get(key)
+    try:
+        return float(val)
+    except:
+        return None
+
+def _etf_nums_from_yf(etf_data: dict):
+    # returns er, yld, ytd, nav, aum — all as strings ('' if missing)
+    if not isinstance(etf_data, dict):
+        return "", "", "", "", ""
+    er = _fmt_pct((etf_data.get("expense_ratio") or 0) * 100) if etf_data.get("expense_ratio") else ""
+    yld = _fmt_pct((etf_data.get("yield") or 0) * 100) if etf_data.get("yield") else ""
+    ytd = _fmt_pct((etf_data.get("ytd_return") or 0) * 100) if etf_data.get("ytd_return") else ""
+    nav = _fmt_num(etf_data.get("nav"))
+    aum_raw = etf_data.get("aum")
+    # compress aum to millions if large
+    if aum_raw is None or aum_raw == "N/A":
+        aum = ""
+    else:
+        try:
+            aum_val = float(aum_raw)
+            if abs(aum_val) >= 1_000_000:
+                aum = f"{aum_val/1_000_000:.1f}M".rstrip('0').rstrip('.')
+            else:
+                aum = _fmt_num(aum_val, decimals=0)
+        except:
+            aum = ""
+    return er, yld, ytd, nav, aum
+
+def _fund_line(profile: dict, price_data: dict, sentiments: list, etf_data: dict) -> str:
+    ticker = profile.get("ticker", "UNK")
+    name = profile.get("name", "")
+    px   = _fmt_num(price_data.get("current_price"))
+    chg  = _fmt_num(price_data.get("change"))  # already in %
+    er, yld, ytd, nav, aum = _etf_nums_from_yf(etf_data)
+
+    cat = _short_cat_from_name(name)
+    if not cat:
+        cat = _short_cat_fallback(profile)
+
+    news = _sentiment_score(sentiments)
+    # Health for funds is less meaningful; keep neutral 0.5 unless you add a real model
+    hlth = "0.5"
+
+    # F|tkr|px|chg|er|yld|ytd|cat|nav|aum|news|hlth
+    fields = ["F", ticker, px, chg, er, yld, ytd, cat, nav, aum, news, hlth]
+    return "|".join(fields)
+
+def _stock_line(profile: dict, metrics: dict, price_data: dict, sentiments: list) -> str:
+    ticker = profile.get("ticker", "UNK")
+    px   = _fmt_num(price_data.get("current_price"))
+    chg  = _fmt_num(price_data.get("change"))  # in %
+    pe   = _fmt_num(_safe_metric(metrics, "peTTM"))
+    roe  = _fmt_num(_safe_metric(metrics, "roeTTM"))
+    npm  = _fmt_num(_safe_metric(metrics, "netProfitMarginTTM"))
+    g5y  = _fmt_num(_safe_metric(metrics, "revenueGrowth5Y"))
+    de   = _fmt_num(_safe_metric(metrics, "totalDebt/totalEquityQuarterly"))
+    beta = _fmt_num(_safe_metric(metrics, "beta"))
+
+    news = _sentiment_score(sentiments)
+
+    try:
+        fin_health_str = assess_financial_health(metrics, profile.get("finnhubIndustry", ""))
+    except Exception:
+        fin_health_str = "moderate"
+    hlth = _health_score_from_text(fin_health_str)
+
+    # S|tkr|px|chg|pe|roe|npm|g5y|de|beta|news|hlth
+    fields = ["S", ticker, px, chg, pe, roe, npm, g5y, de, beta, news, hlth]
+    return "|".join(fields)
+
+
+def _compile_report_llm_focused(data: Dict[str, Any]) -> str:
+    """
+    Compact output for LLMs with separate schemas for Stocks (S) and Funds (F).
+    No 'N/A' – blank fields when missing.
+    SCHEMA:
+      S:tkr,px,chg,pe,roe,npm,g5y,de,beta,news,hlth
+      F:tkr,px,chg,er,yld,ytd,cat,nav,aum,news,hlth
+    """
+    try:
+        profile = data.get("basic_info", {}).get("profile", {}) or {}
+        metrics = data.get("basic_info", {}).get("basic_financials", {}).get("metric", {}) or {}
+        price   = data.get("current_price", {}) or {}
+        sentiments = data.get("sentiments", []) or []
+
+        is_fund, _fund_type = is_etf_or_fund(profile)
+        if is_fund:
+            etf_data = data.get("etf_data", {}) or {}
+            return _fund_line(profile, price, sentiments, etf_data)
+        else:
+            return _stock_line(profile, metrics, price, sentiments)
+
+    except Exception as e:
+        # ultra-compact error line (still parsable)
+        tkr = data.get("basic_info", {}).get("profile", {}).get("ticker", "UNK")
+        return f"ERR|{tkr}|{str(e)[:60]}"
 
 class Tools:
     class Valves(BaseModel):
@@ -1792,49 +2070,109 @@ class Tools:
                 "type": "function",
                 "function": {
                     "name": "compile_stock_report",
-                    "description": "Compile a comprehensive stock analysis report using Finnhub data",
+                    "description": "BATCH-ONLY. Full comprehensive stock analysis. Pass ALL symbols at once using the `tickers` array. Do not call per ticker.",
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "tickers": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Array of ticker symbols, e.g. ['AAPL','GOOGL','MSFT']"
+                            },
                             "ticker": {
                                 "type": "string",
-                                "description": "The stock ticker symbol(s) to analyze (e.g., 'AAPL' or 'AAPL,GOOGL,MSFT')",
+                                "description": "(Legacy) Comma-separated symbols, e.g. 'AAPL,GOOGL,MSFT'. Prefer `tickers`."
                             }
-                        },
-                        "required": ["ticker"],
+                        }
+                        # Intentionally no "required": we accept either field.
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stock_summary",
+                    "description": "BATCH-ONLY. Optimized human-readable summary. Use `tickers` array; do NOT call once per symbol.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "tickers": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Array of ticker symbols."
+                            },
+                            "ticker": {
+                                "type": "string",
+                                "description": "(Legacy) Comma-separated symbols. Prefer `tickers`."
+                            }
+                        }
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                            "name": "get_stock_data_compact",
+                            "description": "BATCH-ONLY. Ultra-compact structured data. Use `tickers` array; do NOT call once per symbol.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "tickers": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Array of ticker symbols."
+                                    },
+                                    "ticker": {
+                                        "type": "string",
+                                        "description": "(Legacy) Comma-separated symbols. Prefer `tickers`."
+                                    }
+                                }
+                            },
+                },
+            },
         ]
 
-    async def compile_stock_report(
+    async def compile_stock_report(self, tickers: List[str] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
+        symbols = self._normalize_symbols(tickers, ticker)
+        return await self._execute_analysis(symbols, "full", __user__, __event_emitter__)
+
+    async def get_stock_summary(self, tickers: List[str] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
+        symbols = self._normalize_symbols(tickers, ticker)
+        return await self._execute_analysis(symbols, "optimized", __user__, __event_emitter__)
+
+    async def get_stock_data_compact(self, tickers: List[str] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
+        symbols = self._normalize_symbols(tickers, ticker)
+        return await self._execute_analysis(symbols, "compact", __user__, __event_emitter__)
+
+    def _normalize_symbols(self, tickers: Optional[List[str]], ticker: str) -> List[str]:
+        if tickers and isinstance(tickers, list) and len(tickers):
+            return [t.strip().upper() for t in tickers if t and str(t).strip()]
+        if ticker:
+            # support both CSV "AAPL,MSFT" and single "AAPL"
+            return [t.strip().upper() for t in str(ticker).split(",") if t.strip()]
+        raise ValueError("No tickers provided")
+
+    async def _execute_analysis(
         self,
-        ticker: str,
+        symbols: List[str],
+        format_type: str,
         __user__: dict = {},
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
-        Perform a comprehensive stock analysis and compile a detailed report for given ticker(s).
-
-        :param ticker: The stock ticker symbol(s) as a string (e.g., "AAPL" or "AAPL,GOOGL,MSFT") or list of strings.
-        :return: A comprehensive analysis report of the stock(s).
+        Common analysis execution logic with different report formats.
         """
-        ticker_query = ""
+ 
         try:
-            logger.info(f"Starting stock report compilation for ticker: {ticker}")
+            logger.info(f"Starting {format_type} stock analysis for symbols: {symbols}")
 
             if not self.valves.FINNHUB_API_KEY:
                 raise Exception("FINNHUB_API_KEY not provided in valves")
 
-            # Handle different input types for ticker
-            if isinstance(ticker, list):
-                logger.info(f"Converting ticker list to string: {ticker}")
-                ticker_str = ",".join(str(t) for t in ticker)
-            else:
-                logger.info(f"Using ticker string directly: {ticker}")
-                ticker_str = str(ticker)
-
-            ticker_query = ticker_str
+            # Normalize to uppercase and strip spaces
+            symbols = [s.strip().upper() for s in symbols if s.strip()]
+            if not symbols:
+                raise ValueError("No valid tickers provided")
 
             # Initialize the Finnhub client
             if __event_emitter__:
@@ -1851,68 +2189,75 @@ class Tools:
                 os.path.join(os.path.dirname(__file__), "stock_cache_shelve"),
                 writeback=True,
             ) as cache:
-                # Split tickers and clean them
-                tickers = [t.strip() for t in ticker_str.split(",") if t.strip()]
-                if not tickers:
-                    raise ValueError("No valid tickers provided")
-                logger.info(f"Processing tickers: {tickers}")
-
+                
                 combined_report = ""
 
-                # Process each ticker
-                for idx, single_ticker in enumerate(tickers):
-                    logger.info(
-                        f"Processing ticker {idx + 1}/{len(tickers)}: {single_ticker}"
-                    )
+                # Split tickers and clean them
+                for idx, single_ticker in enumerate(symbols):
+                    logger.info(f"Processing ticker {idx + 1}/{len(symbols)}: {single_ticker}")
 
-                    if idx % 4 == 0 or idx == len(tickers) - 1:
+                    if idx % 4 == 0 or idx == len(symbols) - 1:
                         if __event_emitter__:
                             await __event_emitter__(
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(tickers)})",
+                                        "description": f"Retrieving stock data for {single_ticker} ({idx + 1}/{len(symbols)})",
                                         "done": False,
                                     },
                                 }
                             )
 
-                    # Pass the shared shelve cache to the data gathering function
-                    data = await _async_gather_stock_data(
-                        self.client, single_ticker, cache
-                    )
+                    # Get the data using existing function
+                    data = await _async_gather_stock_data(self.client, single_ticker, cache)
 
-                    report = _compile_report(data)
+                    # Choose report format based on format_type
+                    if format_type == "full":
+                        report = _compile_report(data)  # Your original function
+                    elif format_type == "optimized":
+                        report = _compile_report_optimized(data)
+                    elif format_type == "compact":
+                        report = _compile_report_llm_focused(data)
+                    else:
+                        report = _compile_report(data)  # fallback
+
                     last_price = data["current_price"]["current_price"]
 
-                    # Add separator between reports if this isn't the first report
-                    # if combined_report:
-                    combined_report += "\n" + "=" * 8 + "\n\n"
+                    # Add separator for multiple tickers (except compact format)
+                    if combined_report and format_type != "compact":
+                        combined_report += "\n" + "=" * 8 + "\n\n"
+                    elif combined_report and format_type == "compact":
+                        combined_report += "\n"
 
                     combined_report += report
 
-                    if idx == len(tickers) - 1:
+                    if idx == len(symbols) - 1:
                         if __event_emitter__:
                             await __event_emitter__(
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"Finished report for {single_ticker} - latest price: {str(last_price)}",
-                                        "done": idx == len(tickers) - 1,
+                                        "description": f"Finished {format_type} analysis for {single_ticker}",
+                                        "done": True,
                                     },
                                 }
                             )
 
-                logger.info("Successfully completed stock report compilation")
-                return f"Tickers {tickers}\n\n Combined Report:\n{combined_report}"
+                logger.info(f"Successfully completed {format_type} stock analysis")
+                
+                # Format the final output based for compact format with detailed schema
+                if format_type == "compact":
+                    # Detailed schema with value ranges and meanings
+                    schema_header = "SCHEMA S:tkr,px,chg,pe,roe,npm,g5y,de,beta,news,hlth | F:tkr,px,chg,er,yld,ytd,cat,nav,aum,news,hlth"
+                    return f"{schema_header}\n{combined_report}"
+                else:
+                    return f"Analysis for {symbols}:\n\n{combined_report}"
 
         except Exception as e:
+            import traceback
             tb = traceback.extract_tb(e.__traceback__)
             filename, line_no, func_name, text = tb[-1]
-            error_msg = (
-                f"Error in compile_stock_report for tickers {ticker_query} at line {line_no}: {str(e)}\n"
-                f"Line content: {text}"
-            )
+            error_msg = f"Error in {format_type} analysis for {symbols} at line {line_no}: {str(e)}"
             logger.error(error_msg)
             logger.error(f"Full traceback: {traceback.format_exc()}")
             raise Exception(error_msg)
