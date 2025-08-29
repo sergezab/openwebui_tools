@@ -1975,58 +1975,49 @@ def _etf_nums_from_yf(etf_data: dict):
     aum_raw = etf_data.get("aum")
     # compress aum to millions if large
     if aum_raw is None or aum_raw == "N/A":
-        aum = ""
+        aum_m = ""
     else:
         try:
-            aum_val = float(aum_raw)
-            if abs(aum_val) >= 1_000_000:
-                aum = f"{aum_val/1_000_000:.1f}M".rstrip('0').rstrip('.')
-            else:
-                aum = _fmt_num(aum_val, decimals=0)
+            aum_val = float(aum_raw) / 1_000_000.0
+            aum_m = _fmt_num(aum_val)  # compact like 1234.5 (meaning $1.23B)
         except:
-            aum = ""
-    return er, yld, ytd, nav, aum
+            aum_m = ""
+    return er, yld, ytd, nav, aum_m
 
 def _fund_line(profile: dict, price_data: dict, sentiments: list, etf_data: dict) -> str:
     ticker = profile.get("ticker", "UNK")
     name = profile.get("name", "")
-    px   = _fmt_num(price_data.get("current_price"))
-    chg  = _fmt_num(price_data.get("change"))  # already in %
-    er, yld, ytd, nav, aum = _etf_nums_from_yf(etf_data)
+    px     = _fmt_num(price_data.get("current_price"))
+    dchg_p = _fmt_num(price_data.get("change"))
+    er_p, yld_p, ytd_p, nav, aum_m = _etf_nums_from_yf(etf_data)  # make aum in millions
+    cat    = _short_cat_from_name(name) or _short_cat_fallback(profile)
+    news   = _sentiment_score(sentiments)
+    hlth   = "0.5"  # or a smarter rule if you add one later
 
-    cat = _short_cat_from_name(name)
-    if not cat:
-        cat = _short_cat_fallback(profile)
-
-    news = _sentiment_score(sentiments)
-    # Health for funds is less meaningful; keep neutral 0.5 unless you add a real model
-    hlth = "0.5"
-
-    # F|tkr|px|chg|er|yld|ytd|cat|nav|aum|news|hlth
-    fields = ["F", ticker, px, chg, er, yld, ytd, cat, nav, aum, news, hlth]
+    # F|tkr|px|dchg_p|er_p|yld_p|ytd_p|cat|nav|aum_m|news_01|hlth_01
+    fields = ["F", ticker, px, dchg_p, er_p, yld_p, ytd_p, cat, nav, aum_m, news, hlth]
     return "|".join(fields)
 
 def _stock_line(profile: dict, metrics: dict, price_data: dict, sentiments: list) -> str:
     ticker = profile.get("ticker", "UNK")
-    px   = _fmt_num(price_data.get("current_price"))
-    chg  = _fmt_num(price_data.get("change"))  # in %
-    pe   = _fmt_num(_safe_metric(metrics, "peTTM"))
-    roe  = _fmt_num(_safe_metric(metrics, "roeTTM"))
-    npm  = _fmt_num(_safe_metric(metrics, "netProfitMarginTTM"))
-    g5y  = _fmt_num(_safe_metric(metrics, "revenueGrowth5Y"))
-    de   = _fmt_num(_safe_metric(metrics, "totalDebt/totalEquityQuarterly"))
-    beta = _fmt_num(_safe_metric(metrics, "beta"))
-
-    news = _sentiment_score(sentiments)
-
+    px     = _fmt_num(price_data.get("current_price"))
+    dchg_p = _fmt_num(price_data.get("change"))        # already percent value
+    pe_r   = _fmt_num(_safe_metric(metrics, "peTTM"))
+    roe_p  = _fmt_num(_safe_metric(metrics, "roeTTM"))
+    npm_p  = _fmt_num(_safe_metric(metrics, "netProfitMarginTTM"))
+    rev5y_p= _fmt_num(_safe_metric(metrics, "revenueGrowth5Y"))
+    de_r   = _fmt_num(_safe_metric(metrics, "totalDebt/totalEquityQuarterly"))
+    beta   = _fmt_num(_safe_metric(metrics, "beta"))
+    news   = _sentiment_score(sentiments)              # 0..1 as string
+    
     try:
         fin_health_str = assess_financial_health(metrics, profile.get("finnhubIndustry", ""))
     except Exception:
         fin_health_str = "moderate"
-    hlth = _health_score_from_text(fin_health_str)
+    hlth   = _health_score_from_text(fin_health_str)   # 0..1 as string
 
-    # S|tkr|px|chg|pe|roe|npm|g5y|de|beta|news|hlth
-    fields = ["S", ticker, px, chg, pe, roe, npm, g5y, de, beta, news, hlth]
+    # S|tkr|px|dchg_p|pe_r|roe_p|npm_p|rev5y_p|de_r|beta|news_01|hlth_01
+    fields = ["S", ticker, px, dchg_p, pe_r, roe_p, npm_p, rev5y_p, de_r, beta, news, hlth]
     return "|".join(fields)
 
 
@@ -2248,7 +2239,10 @@ class Tools:
                 # Format the final output based for compact format with detailed schema
                 if format_type == "compact":
                     # Detailed schema with value ranges and meanings
-                    schema_header = "SCHEMA S:tkr,px,chg,pe,roe,npm,g5y,de,beta,news,hlth | F:tkr,px,chg,er,yld,ytd,cat,nav,aum,news,hlth"
+                    schema_header = (
+                        "SCHEMA S:tkr,px,dchg_p,pe_r,roe_p,npm_p,rev5y_p,de_r,beta,news_01,hlth_01 | "
+                        "F:tkr,px,dchg_p,er_p,yld_p,ytd_p,cat,nav,aum_m,news_01,hlth_01  # _p=%,_r=ratio,_01=[0..1]"
+                )
                     return f"{schema_header}\n{combined_report}"
                 else:
                     return f"Analysis for {symbols}:\n\n{combined_report}"
