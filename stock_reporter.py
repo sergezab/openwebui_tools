@@ -5,29 +5,32 @@ author: Sergii Zabigailo
 author_url: https://github.com/sergezab/
 github: https://github.com/sergezab/openwebui_tools/
 funding_url: https://github.com/open-webui
-version: 0.3.0
+version: 0.3.1
 license: MIT
 requirements: finnhub-python,pytz
 """
 
-from __future__ import annotations
-
-import os
+import asyncio
+import difflib
 import json
-import time
-import random
 import logging
+import os
+import random
 import shelve
-from functools import lru_cache, wraps
+import time
+import traceback
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable, Union
+from functools import lru_cache, wraps
+from typing import (Any, Awaitable, Callable, Dict, List, Optional, Tuple,
+                    TypedDict, Union)
 
-import pytz
+import aiohttp
 import finnhub
-import yfinance as yf
-
+import pytz
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import yfinance as yf
+from pydantic import BaseModel, Field
+from transformers import (AutoModelForSequenceClassification, AutoTokenizer)
 
 # ---------------------------
 # Logging (safe, single init)
@@ -50,24 +53,19 @@ if not logger.handlers:  # avoid duplicate handlers on reload
 
 EST = pytz.timezone("US/Eastern")
 
-
 def now_est() -> datetime:
     return datetime.now(EST)
-
 
 def format_date(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
-
 def last_trading_day(ts: Optional[datetime] = None) -> datetime:
     cur = ts.astimezone(EST) if ts else now_est()
-    # If before open, consider yesterday
     m_open = cur.replace(hour=9, minute=30, second=0, microsecond=0)
     day = cur - timedelta(days=1) if cur < m_open else cur
     while day.weekday() >= 5:
         day -= timedelta(days=1)
     return day
-
 
 def is_market_open(ts: Optional[datetime] = None) -> Tuple[bool, str]:
     now = ts.astimezone(EST) if ts else now_est()
@@ -81,11 +79,9 @@ def is_market_open(ts: Optional[datetime] = None) -> Tuple[bool, str]:
         return False, f"Closed 4:00 PM EST (now {now.strftime('%I:%M %p')} EST)"
     return True, "Market is open"
 
-
 # ---------------------------
 # Retry with backoff
 # ---------------------------
-
 
 def retry_with_backoff(max_retries=3, initial_backoff=1.0, max_backoff=15.0):
     def decorator(fn: Callable):
@@ -97,93 +93,162 @@ def retry_with_backoff(max_retries=3, initial_backoff=1.0, max_backoff=15.0):
                     return fn(*args, **kwargs)
                 except Exception as e:
                     msg = str(e)
+                    # Do NOT retry on signature errors (developer bug)
+                    if "unexpected keyword argument" in msg.lower():
+                        raise
                     retriable = any(
                         s in msg.lower()
                         for s in ["429", "limit", "timeout", "connection", "504", "502"]
                     )
                     if not retriable or attempt == max_retries:
                         raise
-                    sleep_s = min(
-                        backoff * (3 if "429" in msg else 1), max_backoff
-                    ) + random.uniform(0, 1)
-                    logger.warning(
-                        f"{fn.__name__} failed (attempt {attempt}/{max_retries}): {msg}. Retrying in {sleep_s:.1f}s"
-                    )
+                    sleep_s = min(backoff * (3 if "429" in msg else 1), max_backoff) + random.uniform(0, 1)
+                    logger.warning(f"{fn.__name__} failed (attempt {attempt}/{max_retries}): {msg}. Retrying in {sleep_s:.1f}s")
                     time.sleep(sleep_s)
                     backoff = min(backoff * 2, max_backoff)
-
         return wrapper
-
     return decorator
-
 
 # ---------------------------
 # Finnhub calls (wrapped)
 # ---------------------------
 
-
 @retry_with_backoff()
 def fh_profile(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
-    return client.company_profile2(symbol=ticker, timeout=10)
-
+    return client.company_profile2(symbol=ticker)
 
 @retry_with_backoff()
 def fh_financials(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
     return client.company_basic_financials(ticker, "all")
 
-
 @retry_with_backoff()
 def fh_peers(client: finnhub.Client, ticker: str) -> List[str]:
     return client.company_peers(ticker)
 
-
 @retry_with_backoff()
 def fh_quote(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
-    return client.quote(ticker, timeout=10)
-
+    return client.quote(ticker)
 
 @retry_with_backoff()
-def fh_news(
-    client: finnhub.Client, ticker: str, start: str, end: str
-) -> List[Dict[str, Any]]:
-    return client.company_news(ticker, start, end, timeout=10)
-
+def fh_news(client: finnhub.Client, ticker: str, start: str, end: str) -> List[Dict[str, Any]]:
+    return client.company_news(ticker, start, end)
 
 # ---------------------------
 # Sentiment model (cached)
 # ---------------------------
+_sentiment_model_cache = {}
 
+def _get_sentiment_model():
+    """Load and cache the sentiment analysis model and tokenizer using a global dict."""
+    # Return the cached model if it's already loaded.
+    if "model" in _sentiment_model_cache:
+        return _sentiment_model_cache["tokenizer"], _sentiment_model_cache["model"]
 
-@lru_cache(maxsize=1)
-def get_sentiment_model():
-    name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
-    tok = AutoTokenizer.from_pretrained(name)
-    mdl = AutoModelForSequenceClassification.from_pretrained(name)
-    device = 0 if torch.cuda.is_available() else -1
-    return tok, mdl, device
+    logger.info("Loading sentiment analysis model for the first time...")
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {device} for sentiment model.")
+        model_name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Use device_map to ensure the model's weights are loaded directly to the correct device.
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, device_map=device)
+
+        # Store the loaded model in the global cache.
+        _sentiment_model_cache["tokenizer"] = tokenizer
+        _sentiment_model_cache["model"] = model
+        logger.info("Sentiment model loaded and cached successfully.")
+        return tokenizer, model
+    except Exception as e:
+        logger.critical(f"Fatal error: Failed to load sentiment model: {e}", exc_info=True)
+        # Return None to indicate failure, preventing the tool from proceeding with a broken model.
+        return None, None
+
+def _get_sentiment_from_keywords(text: str) -> Tuple[str, float]:
+    """Perform a quick sentiment analysis based on financial keywords."""
+    text_lower = text.lower()
+    negative_keywords = [
+        "weak", "concern", "risk", "overvalued", "bearish", "sell", "short",
+        "downgrade", "warning", "caution", "negative", "decline", "drop",
+        "fall", "loses", "plunge", "crash", "bubble", "expensive", "correction",
+        "miss", "fails", "failed", "disappointing",
+    ]
+    positive_keywords = [
+        "strong", "buy", "bullish", "undervalued", "opportunity", "upgrade",
+        "outperform", "beat", "exceeded", "growth", "positive", "potential",
+        "momentum", "successful", "gain", "rally", "surge", "breakthrough",
+        "innovative", "leading", "dominant",
+    ]
+    neg_count = sum(1 for word in negative_keywords if word in text_lower)
+    pos_count = sum(1 for word in positive_keywords if word in text_lower)
+
+    total = neg_count + pos_count
+    if total == 0:
+        return "neutral", 0.5
+    if neg_count > pos_count:
+        return "negative", min(0.9, neg_count / (total + 1))
+    return "positive", min(0.9, pos_count / (total + 1))
+
+async def _analyze_sentiment(title: str, summary: str) -> Dict[str, Any]:
+    """Perform sentiment analysis combining keyword and model-based approaches."""
+    try:
+        tokenizer, model = _get_sentiment_model()
+        # If model loading failed, we can't proceed.
+        if not model or not tokenizer:
+            raise RuntimeError("Sentiment model is not available.")
+
+        device = model.device
+        combined_text = f"Headline: {title}\nSummary: {summary}"
+        
+        # Keyword-based analysis
+        kw_sentiment, kw_confidence = _get_sentiment_from_keywords(combined_text)
+
+        # Model-based analysis
+        inputs = tokenizer(combined_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()} # Move inputs to model's device
+
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        
+        probabilities = torch.nn.functional.softmax(logits, dim=-1).cpu() # Move to CPU
+        scores = probabilities.tolist()[0]
+        confidence = max(scores)
+        
+        id2label = model.config.id2label
+        predicted_index = torch.argmax(probabilities, dim=-1).item()
+        model_sentiment = id2label[predicted_index].lower()
+
+        # Combine results
+        if kw_sentiment == model_sentiment:
+            final_sentiment = model_sentiment
+            final_confidence = (kw_confidence + confidence) / 2
+        else: # Disagreement, prefer model but with slight penalty
+            final_sentiment = model_sentiment
+            final_confidence = confidence * 0.8
+        
+        return {
+            "sentiment": final_sentiment,
+            "confidence": final_confidence,
+        }
+    except Exception as e:
+        logger.warning(f"Error in sentiment analysis for '{title}': {e}")
+        return {"sentiment": "neutral", "confidence": 0.0}
 
 
 # ---------------------------
 # Utilities
 # ---------------------------
 
-
 def is_html_response(resp: Any) -> bool:
-    return isinstance(resp, str) and (
-        "<html" in resp.lower() or "<!doctype" in resp.lower()
-    )
+    return isinstance(resp, str) and ("<html" in resp.lower() or "<!doctype" in resp.lower())
 
-
-def is_similar(a: str, b: str, threshold: float = 0.9) -> bool:
-    a, b = a.strip().lower(), b.strip().lower()
-    # lightweight similarity (fast) – no difflib at runtime
+def is_similar(a: str, b: str) -> bool:
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
     if not a or not b:
         return False
     if a == b:
         return True
-    # fallback: prefix or containment quick check
-    return a.startswith(b[:20]) or b.startswith(a[:20]) or (a in b) or (b in a)
-
+    return a in b or b in a
 
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
@@ -191,13 +256,11 @@ def safe_float(v: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
-
 def safe_num_str(v: Any, fmt: str = ".2f", default: str = "N/A") -> str:
     try:
         return f"{float(v):{fmt}}"
     except Exception:
         return default
-
 
 def format_pct(v: Any) -> str:
     try:
@@ -206,19 +269,15 @@ def format_pct(v: Any) -> str:
     except Exception:
         return "N/A"
 
-
 def format_currency(v: Any, suffix: bool = True) -> str:
     try:
         x = float(v)
         if suffix:
-            if x >= 1_000_000_000:
-                return f"${x/1_000_000_000:.2f}B"
-            if x >= 1_000_000:
-                return f"${x/1_000_000:.2f}M"
+            if x >= 1_000_000_000: return f"${x/1_000_000_000:.2f}B"
+            if x >= 1_000_000:     return f"${x/1_000_000:.2f}M"
         return f"${x:,.2f}"
     except Exception:
         return "N/A"
-
 
 def format_unix_date(ts: Any) -> str:
     try:
@@ -227,11 +286,9 @@ def format_unix_date(ts: Any) -> str:
     except Exception:
         return "N/A"
 
-
 # ---------------------------
-# Cache freshness
+# Cache helpers
 # ---------------------------
-
 
 def cache_is_today(bucket: Dict[str, Any], key: str) -> bool:
     if not bucket or key not in bucket:
@@ -244,6 +301,14 @@ def cache_is_today(bucket: Dict[str, Any], key: str) -> bool:
     except Exception:
         return False
 
+def cache_get(bucket: Dict[str, Any], key: str, fallback: Any = None) -> Any:
+    try:
+        return bucket.get(key, {}).get("data", fallback)
+    except Exception:
+        return fallback
+
+def cache_set(bucket: Dict[str, Any], key: str, data: Any) -> None:
+    bucket[key] = {"data": data, "timestamp": now_est().isoformat()}
 
 def price_cache_stale(ts: datetime) -> bool:
     if ts.tzinfo is None:
@@ -259,37 +324,15 @@ def price_cache_stale(ts: datetime) -> bool:
         return (now - ts).total_seconds() > 60 * 60
     if ts.date() == now.date():
         return False
-    # If from last trading day, ensure after close
     last_close = ts.replace(hour=16, minute=0, second=0, microsecond=0)
     return ts < last_close
-
 
 # ---------------------------
 # Classification helpers
 # ---------------------------
 
-COMMON_ETFS = {
-    "spy",
-    "qqq",
-    "voo",
-    "dia",
-    "iwm",
-    "vti",
-    "gld",
-    "xlf",
-    "xle",
-    "xlu",
-    "vnq",
-    "kweb",
-    "ihi",
-    "ewz",
-    "bnd",
-    "vusxx",
-    "vwo",
-    "botz",
-    "snsxx",
-}
-
+COMMON_MMFS = {"snsxx","vusxx"}
+COMMON_ETFS = {"spy","qqq","voo","dia","iwm","vti","gld","xlf","xle","xlu","vnq","kweb","ihi","ewz","bnd","vwo","botz"}
 
 def classify_security(profile: Dict[str, Any]) -> Tuple[bool, str]:
     """Returns (is_fund, type_str)"""
@@ -298,34 +341,20 @@ def classify_security(profile: Dict[str, Any]) -> Tuple[bool, str]:
     name = (profile.get("name") or "").lower()
     ticker = (profile.get("ticker") or "").lower()
     stype = (profile.get("type") or "").lower()
-
-    if any(
-        k in name for k in ["etf", "exchange traded fund", "index fund", "index trust"]
-    ) or ticker.endswith("etf"):
-        return True, "ETF"
-    if any(
-        k in name
-        for k in ["money market", "cash reserves", "liquidity fund", "treasury", "govt"]
-    ) or ticker.endswith("mm"):
+    if ticker in COMMON_MMFS or any(k in name for k in ["money market","cash reserves","liquidity fund","treasury","govt"]):
         return True, "Money Market Fund"
+    if ticker in COMMON_ETFS or any(k in name for k in ["etf", "exchange traded fund", "index fund", "index trust"]) or ticker.endswith("etf"):
+        return True, "ETF"
     if stype and ("etf" in stype or "fund" in stype):
         return True, "ETF"
-    if ticker in COMMON_ETFS:
-        return (True, "Money Market Fund") if "snsxx" in ticker else (True, "ETF")
     return False, "Stock"
-
 
 # ---------------------------
 # Finnhub data shaping
 # ---------------------------
 
-
 def get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "profile": {"ticker": ticker, "name": ticker},
-        "basic_financials": {"metric": {}},
-        "peers": [],
-    }
+    out: Dict[str, Any] = {"profile": {"ticker": ticker, "name": ticker}, "basic_financials": {"metric": {}}, "peers": []}
     try:
         prof = fh_profile(client, ticker)
         if isinstance(prof, dict) and not is_html_response(prof):
@@ -342,37 +371,37 @@ def get_basic_info(client: finnhub.Client, ticker: str) -> Dict[str, Any]:
         logger.warning(f"basic info fallback for {ticker}: {e}")
     return out
 
+# in-batch memo for quotes and etf extras
+_batch_quote_cache: Dict[str, Dict[str, Any]] = {}
+_batch_etf_extras_cache: Dict[str, Dict[str, Any]] = {}
 
 def get_current_price(client: finnhub.Client, ticker: str) -> Optional[Dict[str, Any]]:
+    if ticker in _batch_quote_cache:
+        return _batch_quote_cache[ticker]
     try:
         q = fh_quote(client, ticker)
         c, dp, pc = q.get("c", 0.0), q.get("dp", 0.0), q.get("pc", 0.0)
         suspicious = abs(dp) > 1000 or pc < 0.10 or (pc and c > pc * 50)
         if suspicious:
             logger.warning(f"Suspicious quote for {ticker}: c={c}, pc={pc}, dp={dp}")
-            return {
-                "current_price": c,
-                "change": 0.0,
-                "change_amount": 0.0,
-                "high": q.get("h", 0.0),
-                "low": q.get("l", 0.0),
-                "open": q.get("o", 0.0),
-                "previous_close": pc,
-                "data_warning": "Potentially stale/delisted",
+            data = {
+                "current_price": c, "change": 0.0, "change_amount": 0.0,
+                "high": q.get("h", 0.0), "low": q.get("l", 0.0),
+                "open": q.get("o", 0.0), "previous_close": pc,
+                "data_warning": "Potentially stale/delisted"
             }
-        return {
-            "current_price": c,
-            "change": dp,
-            "change_amount": q.get("d", 0.0),
-            "high": q.get("h", 0.0),
-            "low": q.get("l", 0.0),
-            "open": q.get("o", 0.0),
-            "previous_close": pc,
+            _batch_quote_cache[ticker] = data
+            return data
+        data = {
+            "current_price": c, "change": dp, "change_amount": q.get("d", 0.0),
+            "high": q.get("h", 0.0), "low": q.get("l", 0.0),
+            "open": q.get("o", 0.0), "previous_close": pc
         }
+        _batch_quote_cache[ticker] = data
+        return data
     except Exception as e:
         logger.error(f"price error {ticker}: {e}")
         return None
-
 
 def get_company_news(client: finnhub.Client, ticker: str) -> List[Dict[str, str]]:
     try:
@@ -392,101 +421,16 @@ def get_company_news(client: finnhub.Client, ticker: str) -> List[Dict[str, str]
 
 
 # ---------------------------
-# Sentiment (async-friendly)
-# ---------------------------
-
-
-def analyze_sentiment(summary: str, title: str) -> Dict[str, Any]:
-    try:
-        tok, mdl, device = get_sentiment_model()
-        # keyword prior
-        text = f"Headline: {title}\nSummary: {summary}"
-        lower = text.lower()
-        neg_words = [
-            "weak",
-            "concern",
-            "risk",
-            "overvalued",
-            "bearish",
-            "sell",
-            "short",
-            "downgrade",
-            "warning",
-            "decline",
-            "drop",
-            "plunge",
-            "miss",
-            "failed",
-            "disappointing",
-            "caution",
-        ]
-        pos_words = [
-            "strong",
-            "buy",
-            "bullish",
-            "undervalued",
-            "upgrade",
-            "outperform",
-            "beat",
-            "growth",
-            "positive",
-            "rally",
-            "surge",
-            "breakthrough",
-            "leader",
-        ]
-        neg = sum(w in lower for w in neg_words)
-        pos = sum(w in lower for w in pos_words)
-        base = (
-            ("negative", min(0.9, neg / max(1, neg + pos)))
-            if neg > pos
-            else (
-                ("positive", min(0.9, pos / max(1, neg + pos)))
-                if pos > neg
-                else ("neutral", 0.5)
-            )
-        )
-
-        inputs = tok(lower, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            outputs = mdl(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1).tolist()[
-            0
-        ]  # [neutral, positive, negative] for this model
-        labels = getattr(
-            mdl.config, "id2label", {0: "neutral", 1: "positive", 2: "negative"}
-        )
-        pred_idx = int(max(range(len(probs)), key=lambda i: probs[i]))
-        model_sent = labels[pred_idx].lower()
-        model_conf = float(max(probs))
-
-        # blend
-        if base[0] == model_sent:
-            sent, conf = model_sent, (base[1] + model_conf) / 2
-        else:
-            sent, conf = base if base[1] > model_conf else (model_sent, model_conf)
-            conf *= 0.8  # penalty on disagreement
-
-        return {
-            "sentiment": sent,
-            "confidence": float(conf),
-            "probabilities": [[round(p, 5) for p in probs]],
-        }
-    except Exception as e:
-        logger.warning(f"sentiment fallback: {e}")
-        return {"sentiment": "neutral", "confidence": 0.0, "probabilities": []}
-
-
-# ---------------------------
 # ETF helpers (yfinance)
 # ---------------------------
 
-
 def load_etf_extras(ticker: str) -> Dict[str, Any]:
+    if ticker in _batch_etf_extras_cache:
+        return _batch_etf_extras_cache[ticker]
     try:
         yf_t = yf.Ticker(ticker)
         info = getattr(yf_t, "info", {}) or {}
-        return {
+        data = {
             "expense_ratio": info.get("expenseRatio"),
             "category": info.get("category"),
             "aum": info.get("totalAssets"),
@@ -499,34 +443,45 @@ def load_etf_extras(ticker: str) -> Dict[str, Any]:
             "seven_day_yield": info.get("sevenDayYield"),
             "weighted_avg_maturity": info.get("weightedAverageMaturity"),
         }
+        _batch_etf_extras_cache[ticker] = data
+        return data
     except Exception as e:
         logger.warning(f"yfinance etf extras error {ticker}: {e}")
         return {}
 
+def yfinance_price_fallback(ticker: str) -> Optional[Dict[str, Any]]:
+    try:
+        yf_t = yf.Ticker(ticker)
+        hist = yf_t.history(period="2d")
+        if hist.empty:
+            return None
+        last = hist.iloc[-1]
+        prev = hist.iloc[-2] if len(hist) > 1 else last
+        return {
+            "current_price": float(last["Close"]),
+            "change": float((last["Close"]/prev["Close"] - 1) * 100) if float(prev["Close"]) else 0.0,
+            "change_amount": float(last["Close"] - prev["Close"]),
+            "high": float(last["High"]),
+            "low": float(last["Low"]),
+            "open": float(last["Open"]),
+            "previous_close": float(prev["Close"]),
+        }
+    except Exception:
+        return None
 
 # ---------------------------
 # Data gather (per ticker)
 # ---------------------------
 
-
 async def gather_stock_data(
-    client: finnhub.Client, ticker: str, cache: shelve.Shelf
+    client: finnhub.Client,
+    ticker: str,
+    cache: shelve.Shelf,
+    include_news: bool = True
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {
-        "basic_info": {
-            "profile": {"ticker": ticker, "name": ticker},
-            "basic_financials": {"metric": {}},
-            "peers": [],
-        },
-        "current_price": {
-            "current_price": 0.0,
-            "change": 0.0,
-            "change_amount": 0.0,
-            "high": 0.0,
-            "low": 0.0,
-            "open": 0.0,
-            "previous_close": 0.0,
-        },
+        "basic_info": {"profile": {"ticker": ticker, "name": ticker}, "basic_financials": {"metric": {}}, "peers": []},
+        "current_price": {"current_price": 0.0, "change": 0.0, "change_amount": 0.0, "high": 0.0, "low": 0.0, "open": 0.0, "previous_close": 0.0},
         "sentiments": [],
         "is_etf": False,
         "fund_type": "Stock",
@@ -539,9 +494,9 @@ async def gather_stock_data(
     if not cache_is_today(tcache, "basic_info"):
         logger.info(f"Fetching basic info for {ticker}")
         basic = get_basic_info(client, ticker)
-        tcache["basic_info"] = {"data": basic, "timestamp": now_est().isoformat()}
+        cache_set(tcache, "basic_info", basic)
     else:
-        basic = tcache["basic_info"]["data"]
+        basic = cache_get(tcache, "basic_info", result["basic_info"])
         logger.info(f"Using cached basic info for {ticker}")
     result["basic_info"] = basic
 
@@ -553,10 +508,10 @@ async def gather_stock_data(
     # etf extras (cache)
     if is_fund:
         if cache_is_today(tcache, "etf_data"):
-            result["etf_data"] = tcache["etf_data"]["data"]
+            result["etf_data"] = cache_get(tcache, "etf_data", {})
         else:
             extras = load_etf_extras(ticker)
-            tcache["etf_data"] = {"data": extras, "timestamp": now_est().isoformat()}
+            cache_set(tcache, "etf_data", extras)
             result["etf_data"] = extras
 
     # price
@@ -568,227 +523,134 @@ async def gather_stock_data(
         if use_cached:
             logger.info(f"Using cached price for {ticker}")
     if use_cached:
-        price = tcache["current_price"]["data"]
+        price = cache_get(tcache, "current_price", result["current_price"])
     else:
         logger.info(f"Fetching price for {ticker}")
         price = get_current_price(client, ticker)
         if price is None and is_fund:
-            # yfinance fallback for funds
-            try:
-                yf_t = yf.Ticker(ticker)
-                hist = yf_t.history(period="2d")
-                if not hist.empty:
-                    last = hist.iloc[-1]
-                    prev = hist.iloc[-2] if len(hist) > 1 else last
-                    price = {
-                        "current_price": float(last["Close"]),
-                        "change": (
-                            float((last["Close"] / prev["Close"] - 1) * 100)
-                            if float(prev["Close"])
-                            else 0.0
-                        ),
-                        "change_amount": float(last["Close"] - prev["Close"]),
-                        "high": float(last["High"]),
-                        "low": float(last["Low"]),
-                        "open": float(last["Open"]),
-                        "previous_close": float(prev["Close"]),
-                    }
-            except Exception as e:
-                logger.warning(f"yfinance price fallback error {ticker}: {e}")
+            price = yfinance_price_fallback(ticker)
         if price is None:
-            price = {
-                "current_price": 0.0,
-                "change": 0.0,
-                "change_amount": 0.0,
-                "high": 0.0,
-                "low": 0.0,
-                "open": 0.0,
-                "previous_close": 0.0,
-            }
+            price = result["current_price"]
         else:
-            tcache["current_price"] = {
-                "data": price,
-                "timestamp": now_est().isoformat(),
-            }
+            cache_set(tcache, "current_price", price)
     result["current_price"] = price
 
-    # news + sentiments
-    if not cache_is_today(tcache, "sentiments"):
-        news = get_company_news(client, ticker)
-        news = [n for n in news if n.get("title")]
-        items: List[Dict[str, Any]] = []
-        for n in news:
-            title, summary = n.get("title", ""), n.get("summary", "")
-            effective_summary = "" if is_similar(title, summary) else summary
-            sent = analyze_sentiment(effective_summary, title)
-            items.append(
-                {
-                    "url": n.get("url", ""),
-                    "title": title or "No title",
-                    "summary": effective_summary,
-                    "sentiment": sent.get("sentiment", "neutral"),
-                    "confidence": sent.get("confidence", 0.0),
-                    "probabilities": sent.get("probabilities", []),
-                }
-            )
-        tcache["sentiments"] = {"data": items, "timestamp": now_est().isoformat()}
-        result["sentiments"] = items
+    # news + sentiments (optional / skip for compact)
+    if include_news:
+        if not cache_is_today(tcache, "sentiments"):
+            news = get_company_news(client, ticker)
+            news = [n for n in news if n.get("title")]
+            items: List[Dict[str, Any]] = []
+
+            # fire sentiment off-thread to avoid blocking
+            tasks = []
+            for n in news:
+                title, summary = n.get("title", ""), n.get("summary", "")
+                effective_summary = "" if is_similar(title, summary) else summary
+                tasks.append(_analyze_sentiment(title, effective_summary))
+
+            sentiments = await asyncio.gather(*tasks) if tasks else []
+            for n, s in zip(news, sentiments):
+                items.append({
+                    "url": n.get("url",""),
+                    "title": n.get("title","No title"),
+                    "summary": "" if is_similar(n.get("title",""), n.get("summary","")) else n.get("summary",""),
+                    "sentiment": s.get("sentiment","neutral"),
+                    "confidence": s.get("confidence",0.0),
+                    "probabilities": s.get("probabilities", []),
+                })
+            cache_set(tcache, "sentiments", items)
+            result["sentiments"] = items
+        else:
+            result["sentiments"] = cache_get(tcache, "sentiments", [])
     else:
-        result["sentiments"] = tcache["sentiments"]["data"]
+        result["sentiments"] = []
 
     cache[ticker] = tcache
     return result
 
-
 # ---------------------------
-# Analysis / Reports
+# Analysis / Reports (unchanged logic, minor polish)
 # ---------------------------
 
-
-def assess_financial_health(
-    metrics: Dict[str, Any], industry: Optional[str] = None
-) -> str:
+def assess_financial_health(metrics: Dict[str, Any], industry: Optional[str] = None) -> str:
     try:
         ind = (industry or "").lower()
-        kind = (
-            "retail"
-            if "retail" in ind
-            else (
-                "tech"
-                if "technology" in ind
-                else (
-                    "utilities"
-                    if "utilities" in ind
-                    else (
-                        "healthcare"
-                        if ("healthcare" in ind or "health" in ind)
-                        else (
-                            "energy"
-                            if any(k in ind for k in ["energy", "oil", "gas"])
-                            else (
-                                "financial"
-                                if any(k in ind for k in ["financial", "bank"])
-                                else "default"
-                            )
-                        )
-                    )
-                )
-            )
-        )
+        kind = ("retail" if "retail" in ind else
+                "tech" if "technology" in ind else
+                "utilities" if "utilities" in ind else
+                "healthcare" if ("healthcare" in ind or "health" in ind) else
+                "energy" if any(k in ind for k in ["energy","oil","gas"]) else
+                "financial" if any(k in ind for k in ["financial","bank"]) else
+                "default")
 
         th = {
-            "retail": {
-                "profit_margin": (3, 2),
-                "current_ratio": (1.2, 0.8),
-                "inventory_turnover": (10, 6),
-                "debt_equity": (0.5, 1.0),
-            },
-            "tech": {
-                "profit_margin": (20, 15),
-                "current_ratio": (1.5, 1.2),
-                "debt_equity": (0.3, 0.6),
-            },
-            "utilities": {
-                "profit_margin": (12, 8),
-                "current_ratio": (1.0, 0.8),
-                "debt_equity": (1.2, 1.5),
-                "interest_coverage": (3, 2),
-            },
-            "healthcare": {
-                "profit_margin": (15, 10),
-                "current_ratio": (1.5, 1.2),
-                "debt_equity": (0.4, 0.8),
-            },
-            "energy": {
-                "profit_margin": (10, 6),
-                "current_ratio": (1.2, 1.0),
-                "debt_equity": (0.6, 1.0),
-            },
-            "financial": {"roe": (15, 10), "debt_equity": (3.0, 4.0)},
-            "default": {
-                "profit_margin": (15, 10),
-                "current_ratio": (1.5, 1.2),
-                "debt_equity": (0.5, 1.0),
-            },
+            "retail":     {"profit_margin": (3,2), "current_ratio": (1.2,0.8), "inventory_turnover": (10,6), "debt_equity": (0.5,1.0)},
+            "tech":       {"profit_margin": (20,15), "current_ratio": (1.5,1.2), "debt_equity": (0.3,0.6)},
+            "utilities":  {"profit_margin": (12,8), "current_ratio": (1.0,0.8), "debt_equity": (1.2,1.5), "interest_coverage": (3,2)},
+            "healthcare": {"profit_margin": (15,10), "current_ratio": (1.5,1.2), "debt_equity": (0.4,0.8)},
+            "energy":     {"profit_margin": (10,6), "current_ratio": (1.2,1.0), "debt_equity": (0.6,1.0)},
+            "financial":  {"roe": (15,10), "debt_equity": (3.0,4.0)},
+            "default":    {"profit_margin": (15,10), "current_ratio": (1.5,1.2), "debt_equity": (0.5,1.0)},
         }[kind]
 
-        # normalize inputs
         roe = safe_float(metrics.get("roeTTM"))
         cur = safe_float(metrics.get("currentRatioQuarterly"))
-        pm = safe_float(metrics.get("netProfitMarginTTM"))
-        de = safe_float(metrics.get("totalDebt/totalEquityQuarterly"))
-        ic = safe_float(metrics.get("netInterestCoverageTTM"))
-        it = safe_float(metrics.get("inventoryTurnoverTTM"))
+        pm  = safe_float(metrics.get("netProfitMarginTTM"))
+        de  = safe_float(metrics.get("totalDebt/totalEquityQuarterly"))
+        ic  = safe_float(metrics.get("netInterestCoverageTTM"))
+        it  = safe_float(metrics.get("inventoryTurnoverTTM"))
 
         pts = 0
         max_pts = 0
 
-        # PM
         if "profit_margin" in th:
-            hi, mid = th["profit_margin"]
-            max_pts += 2
-            if pm > hi:
-                pts += 2
-            elif pm > mid:
-                pts += 1
-        # ROE
-        hi, mid = (20, 15)
-        if "roe" in th:
-            hi, mid = th["roe"]
-        max_pts += 2
-        if roe > hi:
-            pts += 2
-        elif roe > mid:
-            pts += 1
-        # Current ratio
-        if "current_ratio" in th:
-            hi, _ = th["current_ratio"]
-            max_pts += 1
-            if cur > hi:
-                pts += 1
-        # D/E
-        if "debt_equity" in th:
-            low, med = th["debt_equity"]
-            max_pts += 2
-            if de < low:
-                pts += 2
-            elif de < med:
-                pts += 1
-        # Interest coverage
-        hi, mid = th.get("interest_coverage", (50, 20))
-        max_pts += 2
-        if ic > hi:
-            pts += 2
-        elif ic > mid:
-            pts += 1
-        # Retail extra
-        if kind == "retail" and "inventory_turnover" in th:
-            hi, _ = th["inventory_turnover"]
-            max_pts += 1
-            if it > hi:
-                pts += 1
+            hi, mid = th["profit_margin"]; max_pts += 2
+            if pm > hi: pts += 2
+            elif pm > mid: pts += 1
 
-        score = (pts / max_pts) * 100 if max_pts else 0
+        hi, mid = (20,15)
+        if "roe" in th: hi, mid = th["roe"]
+        max_pts += 2
+        if roe > hi: pts += 2
+        elif roe > mid: pts += 1
+
+        if "current_ratio" in th:
+            hi, _ = th["current_ratio"]; max_pts += 1
+            if cur > hi: pts += 1
+
+        if "debt_equity" in th:
+            low, med = th["debt_equity"]; max_pts += 2
+            if de < low: pts += 2
+            elif de < med: pts += 1
+
+        hi, mid = th.get("interest_coverage",(50,20)); max_pts += 2
+        if ic > hi: pts += 2
+        elif ic > mid: pts += 1
+
+        if kind == "retail" and "inventory_turnover" in th:
+            hi, _ = th["inventory_turnover"]; max_pts += 1
+            if it > hi: pts += 1
+
+        score = (pts/max_pts)*100 if max_pts else 0
         label = "strong" if score >= 70 else "moderate" if score >= 40 else "weak"
         return f"{label} {round(score)}% - {industry or ''}".strip()
     except Exception as e:
         logger.error(f"health error: {e}")
         return "moderate"
 
-
 def compile_report_human(data: Dict[str, Any]) -> str:
-    prof = data.get("basic_info", {}).get("profile", {})
-    metrics = data.get("basic_info", {}).get("basic_financials", {}).get("metric", {})
-    price = data.get("current_price", {})
-    ticker = prof.get("ticker", "Unknown")
-    name = prof.get("name", ticker)
+    prof = data.get("basic_info",{}).get("profile",{})
+    metrics = data.get("basic_info",{}).get("basic_financials",{}).get("metric",{})
+    price = data.get("current_price",{})
+    ticker = prof.get("ticker","Unknown"); name = prof.get("name",ticker)
 
     is_fund, ftype = classify_security(prof)
     market_cap = prof.get("marketCapitalization")
-    mc_display = format_currency((market_cap or 0) * 1_000_000) if market_cap else "N/A"
+    mc_display = format_currency((market_cap or 0)*1_000_000) if market_cap else "N/A"
 
     if is_fund:
-        etf = data.get("etf_data", {})
+        etf = data.get("etf_data",{})
         report = [
             f"Investment Analysis: {name} ({ticker}) - {ftype}",
             f"Fund Overview:",
@@ -829,7 +691,7 @@ def compile_report_human(data: Dict[str, Any]) -> str:
             ]
     else:
         try:
-            health = assess_financial_health(metrics, prof.get("finnhubIndustry", ""))
+            health = assess_financial_health(metrics, prof.get("finnhubIndustry",""))
         except Exception:
             health = "moderate"
         report = [
@@ -856,101 +718,62 @@ def compile_report_human(data: Dict[str, Any]) -> str:
             "",
             f"Summary Analysis: • Health Score: {health}",
         ]
-        # strengths/risks
         strengths, risks = [], []
         try:
-            if safe_float(metrics.get("revenueGrowth5Y")) > 10:
-                strengths.append("High Growth")
-            if safe_float(metrics.get("netProfitMarginTTM")) > 15:
-                strengths.append("Strong Margins")
-            if safe_float(metrics.get("roeTTM")) > 15:
-                strengths.append("Solid ROE")
-            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) < 0.5:
-                strengths.append("Low Leverage")
-            if safe_float(metrics.get("revenueGrowth5Y")) < 0:
-                risks.append("Negative Growth")
-            if safe_float(metrics.get("netProfitMarginTTM")) < 5:
-                risks.append("Low Margins")
-            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) > 2:
-                risks.append("High Leverage")
-            if safe_float(metrics.get("beta")) > 2:
-                risks.append("High Beta")
+            if safe_float(metrics.get("revenueGrowth5Y")) > 10: strengths.append("High Growth")
+            if safe_float(metrics.get("netProfitMarginTTM")) > 15: strengths.append("Strong Margins")
+            if safe_float(metrics.get("roeTTM")) > 15: strengths.append("Solid ROE")
+            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) < 0.5: strengths.append("Low Leverage")
+            if safe_float(metrics.get("revenueGrowth5Y")) < 0: risks.append("Negative Growth")
+            if safe_float(metrics.get("netProfitMarginTTM")) < 5: risks.append("Low Margins")
+            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) > 2: risks.append("High Leverage")
+            if safe_float(metrics.get("beta")) > 2: risks.append("High Beta")
         except Exception:
             pass
-        report.append(
-            f"• Key Strengths: {', '.join(strengths) if strengths else 'None identified'}"
-        )
-        report.append(
-            f"• Key Risks: {', '.join(risks) if risks else 'None identified'}"
-        )
+        report.append(f"• Key Strengths: {', '.join(strengths) if strengths else 'None identified'}")
+        report.append(f"• Key Risks: {', '.join(risks) if risks else 'None identified'}")
 
-    # sentiment summary (both types)
     sentiments = data.get("sentiments", [])
     if sentiments:
-        pos = sum(
-            1
-            for s in sentiments
-            if isinstance(s, dict) and s.get("sentiment") == "positive"
-        )
+        pos = sum(1 for s in sentiments if isinstance(s, dict) and s.get("sentiment") == "positive")
         try:
-            w_pos = sum(
-                float(s.get("confidence", 0))
-                for s in sentiments
-                if s.get("sentiment") == "positive"
-            )
-            w_all = sum(float(s.get("confidence", 0)) for s in sentiments)
+            w_pos = sum(float(s.get("confidence",0)) for s in sentiments if s.get("sentiment") == "positive")
+            w_all = sum(float(s.get("confidence",0)) for s in sentiments)
             ratio = (w_pos / w_all) if w_all else 0.5
-            overall = (
-                "Bullish" if ratio > 0.6 else "Bearish" if ratio < 0.4 else "Neutral"
-            )
+            overall = "Bullish" if ratio > 0.6 else "Bearish" if ratio < 0.4 else "Neutral"
         except Exception:
             overall = "Neutral"
-        report += [
-            "",
-            "Recent News Sentiment:",
-            f"• Overall: {overall} ({pos}/{len(sentiments)} positive)",
-        ]
+        report += ["", "Recent News Sentiment:", f"• Overall: {overall} ({pos}/{len(sentiments)} positive)"]
         for s in sentiments:
-            if not isinstance(s, dict):
-                continue
-            t = s.get("title", "No title")
-            summ = s.get("summary", "")
-            report.append(
-                f"• {s.get('sentiment','neutral')} - {t}{(' - '+summ) if summ else ''}"
-            )
+            if not isinstance(s, dict): continue
+            t = s.get("title","No title"); summ = s.get("summary","")
+            report.append(f"• {s.get('sentiment','neutral')} - {t}{(' - '+summ) if summ else ''}")
 
     return "\n".join(report)
 
-
-# token-optimized human output
 def compile_report_optimized(data: Dict[str, Any]) -> str:
-    prof = data.get("basic_info", {}).get("profile", {})
-    metrics = data.get("basic_info", {}).get("basic_financials", {}).get("metric", {})
-    price = data.get("current_price", {})
-    ticker = prof.get("ticker", "UNK")
-    name = prof.get("name", ticker)
+    prof = data.get("basic_info",{}).get("profile",{})
+    metrics = data.get("basic_info",{}).get("basic_financials",{}).get("metric",{})
+    price = data.get("current_price",{})
+    ticker = prof.get("ticker","UNK"); name = prof.get("name", ticker)
     is_fund, ftype = classify_security(prof)
 
     def compact_cap(x):
         try:
             v = float(x)
-            if v >= 1e12:
-                return f"{v/1e12:.1f}T"
-            if v >= 1e9:
-                return f"{v/1e9:.1f}B"
-            if v >= 1e6:
-                return f"{v/1e6:.1f}M"
-            if v >= 1e3:
-                return f"{v/1e3:.1f}K"
+            if v >= 1e12: return f"{v/1e12:.1f}T"
+            if v >= 1e9:  return f"{v/1e9:.1f}B"
+            if v >= 1e6:  return f"{v/1e6:.1f}M"
+            if v >= 1e3:  return f"{v/1e3:.1f}K"
             return f"{v:.2f}"
         except Exception:
             return "N/A"
 
     mc = prof.get("marketCapitalization")
-    mc_display = compact_cap(mc * 1_000_000) if mc else "N/A"
+    mc_display = compact_cap(mc*1_000_000) if mc else "N/A"
 
     if is_fund:
-        etf = data.get("etf_data", {})
+        etf = data.get("etf_data",{})
         out = [
             f"{name} ({ticker}) - {ftype}",
             f"Price ${safe_num_str(price.get('current_price'))} ({safe_num_str(price.get('change'))}%) | Range ${safe_num_str(price.get('low'))}-${safe_num_str(price.get('high'))}",
@@ -958,16 +781,12 @@ def compile_report_optimized(data: Dict[str, Any]) -> str:
         ]
         if etf:
             if ftype == "ETF":
-                out.append(
-                    f"Expense {format_pct(etf.get('expense_ratio'))} | Yield {format_pct(etf.get('yield'))} | AUM {format_currency(etf.get('aum'))} | YTD {format_pct(etf.get('ytd_return'))}"
-                )
+                out.append(f"Expense {format_pct(etf.get('expense_ratio'))} | Yield {format_pct(etf.get('yield'))} | AUM {format_currency(etf.get('aum'))} | YTD {format_pct(etf.get('ytd_return'))}")
             else:
-                out.append(
-                    f"Yield {format_pct(etf.get('yield'))} | 7D {format_pct(etf.get('seven_day_yield'))} | Assets {format_currency(etf.get('aum'))}"
-                )
+                out.append(f"Yield {format_pct(etf.get('yield'))} | 7D {format_pct(etf.get('seven_day_yield'))} | Assets {format_currency(etf.get('aum'))}")
     else:
         try:
-            health = assess_financial_health(metrics, prof.get("finnhubIndustry", ""))
+            health = assess_financial_health(metrics, prof.get("finnhubIndustry",""))
         except Exception:
             health = "moderate"
         out = [
@@ -979,46 +798,26 @@ def compile_report_optimized(data: Dict[str, Any]) -> str:
         ]
         strengths, risks = [], []
         try:
-            if safe_float(metrics.get("revenueGrowth5Y")) > 10:
-                strengths.append("Growth")
-            if safe_float(metrics.get("netProfitMarginTTM")) > 15:
-                strengths.append("Margins")
-            if safe_float(metrics.get("roeTTM")) > 15:
-                strengths.append("ROE")
-            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) < 0.5:
-                strengths.append("Low Debt")
-            if safe_float(metrics.get("revenueGrowth5Y")) < 0:
-                risks.append("Rev Decline")
-            if safe_float(metrics.get("netProfitMarginTTM")) < 5:
-                risks.append("Low Margins")
-            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) > 2:
-                risks.append("High Debt")
-            if safe_float(metrics.get("beta")) > 2:
-                risks.append("High Beta")
+            if safe_float(metrics.get("revenueGrowth5Y")) > 10: strengths.append("Growth")
+            if safe_float(metrics.get("netProfitMarginTTM")) > 15: strengths.append("Margins")
+            if safe_float(metrics.get("roeTTM")) > 15: strengths.append("ROE")
+            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) < 0.5: strengths.append("Low Debt")
+            if safe_float(metrics.get("revenueGrowth5Y")) < 0: risks.append("Rev Decline")
+            if safe_float(metrics.get("netProfitMarginTTM")) < 5: risks.append("Low Margins")
+            if safe_float(metrics.get("totalDebt/totalEquityQuarterly")) > 2: risks.append("High Debt")
+            if safe_float(metrics.get("beta")) > 2: risks.append("High Beta")
         except Exception:
             pass
         if strengths or risks:
-            out.append(
-                f"+: {', '.join(strengths) if strengths else 'None'} | -: {', '.join(risks) if risks else 'None'}"
-            )
+            out.append(f"+: {', '.join(strengths) if strengths else 'None'} | -: {', '.join(risks) if risks else 'None'}")
 
-    sentiments = data.get("sentiments", [])
+    sentiments = data.get("sentiments",[])
     if sentiments:
-        pos = sum(
-            1
-            for s in sentiments
-            if isinstance(s, dict) and s.get("sentiment") == "positive"
-        )
-        label = (
-            "Bullish"
-            if pos > len(sentiments) / 2
-            else "Bearish" if pos < len(sentiments) / 3 else "Neutral"
-        )
+        pos = sum(1 for s in sentiments if isinstance(s, dict) and s.get("sentiment") == "positive")
+        label = "Bullish" if pos > len(sentiments)/2 else "Bearish" if pos < len(sentiments)/3 else "Neutral"
         out.append(f"News {label} ({pos}/{len(sentiments)} pos)")
     return "\n".join(out)
 
-
-# ultra-compact, LLM-friendly line
 def compile_report_compact(data: Dict[str, Any]) -> str:
     def fmt_num(v: Any, dec=1) -> str:
         try:
@@ -1026,110 +825,67 @@ def compile_report_compact(data: Dict[str, Any]) -> str:
             return s.rstrip("0").rstrip(".")
         except Exception:
             return ""
-
     def s_metric(m: Dict[str, Any], k: str) -> Optional[float]:
-        try:
-            return float(m.get(k))
-        except Exception:
-            return None
-
+        try: return float(m.get(k))
+        except Exception: return None
     def news_score(items: List[Dict[str, Any]]) -> str:
-        if not items:
-            return "0.5"
+        if not items: return "0.5"
         try:
-            pos = sum(
-                1
-                for x in items
-                if isinstance(x, dict) and x.get("sentiment") == "positive"
-            )
+            pos = sum(1 for x in items if isinstance(x, dict) and x.get("sentiment")=="positive")
             return f"{pos/len(items):.2f}".rstrip("0").rstrip(".")
         except Exception:
             return "0.5"
 
-    prof = data.get("basic_info", {}).get("profile", {}) or {}
-    metrics = (
-        data.get("basic_info", {}).get("basic_financials", {}).get("metric", {}) or {}
-    )
-    price = data.get("current_price", {}) or {}
-    sentiments = data.get("sentiments", []) or []
+    prof = data.get("basic_info",{}).get("profile",{}) or {}
+    metrics = data.get("basic_info",{}).get("basic_financials",{}).get("metric",{}) or {}
+    price = data.get("current_price",{}) or {}
+    sentiments = data.get("sentiments",[]) or []
 
     is_fund, _ = classify_security(prof)
     if is_fund:
-        etf = data.get("etf_data", {}) or {}
-        er = (
-            fmt_num((etf.get("expense_ratio") or 0) * 100)
-            if etf.get("expense_ratio")
-            else ""
-        )
+        etf = data.get("etf_data",{}) or {}
+        er = fmt_num((etf.get("expense_ratio") or 0) * 100) if etf.get("expense_ratio") else ""
         yld = fmt_num((etf.get("yield") or 0) * 100) if etf.get("yield") else ""
-        ytd = (
-            fmt_num((etf.get("ytd_return") or 0) * 100) if etf.get("ytd_return") else ""
-        )
+        ytd = fmt_num((etf.get("ytd_return") or 0) * 100) if etf.get("ytd_return") else ""
         nav = fmt_num(etf.get("nav"))
         aum_m = ""
         if etf.get("aum") not in (None, "N/A"):
-            try:
-                aum_m = fmt_num(float(etf["aum"]) / 1_000_000.0)
-            except Exception:
-                aum_m = ""
+            try: aum_m = fmt_num(float(etf["aum"])/1_000_000.0)
+            except Exception: aum_m = ""
         cat = (prof.get("finnhubIndustry") or "")[:6].upper()
-        fields = [
-            "F",
-            prof.get("ticker", "UNK"),
-            fmt_num(price.get("current_price")),
-            fmt_num(price.get("change")),
-            er,
-            yld,
-            ytd,
-            cat,
-            nav,
-            aum_m,
-            news_score(sentiments),
-            "0.5",
-        ]
+        fields = ["F",
+                  prof.get("ticker","UNK"),
+                  fmt_num(price.get("current_price")),
+                  fmt_num(price.get("change")),
+                  er, yld, ytd, cat, nav, aum_m,
+                  news_score(sentiments),
+                  "0.5"]
         return "|".join(fields)
     else:
-        pe = fmt_num(s_metric(metrics, "peTTM"))
-        roe = fmt_num(s_metric(metrics, "roeTTM"))
-        npm = fmt_num(s_metric(metrics, "netProfitMarginTTM"))
-        rev5 = fmt_num(s_metric(metrics, "revenueGrowth5Y"))
-        de = fmt_num(s_metric(metrics, "totalDebt/totalEquityQuarterly"))
-        beta = fmt_num(s_metric(metrics, "beta"))
-        # derive health -> 0..1 from label
+        pe = fmt_num(s_metric(metrics,"peTTM"))
+        roe = fmt_num(s_metric(metrics,"roeTTM"))
+        npm = fmt_num(s_metric(metrics,"netProfitMarginTTM"))
+        rev5 = fmt_num(s_metric(metrics,"revenueGrowth5Y"))
+        de = fmt_num(s_metric(metrics,"totalDebt/totalEquityQuarterly"))
+        beta = fmt_num(s_metric(metrics,"beta"))
         try:
-            health_lbl = assess_financial_health(
-                metrics, prof.get("finnhubIndustry", "")
-            ).lower()
-            h = (
-                "0.8"
-                if "strong" in health_lbl
-                else "0.2" if "weak" in health_lbl else "0.5"
-            )
+            health_lbl = assess_financial_health(metrics, prof.get("finnhubIndustry","")).lower()
+            h = "0.8" if "strong" in health_lbl else "0.2" if "weak" in health_lbl else "0.5"
         except Exception:
             h = "0.5"
-        fields = [
-            "S",
-            prof.get("ticker", "UNK"),
-            fmt_num(price.get("current_price")),
-            fmt_num(price.get("change")),
-            pe,
-            roe,
-            npm,
-            rev5,
-            de,
-            beta,
-            news_score(sentiments),
-            h,
-        ]
+        fields = ["S",
+                  prof.get("ticker","UNK"),
+                  fmt_num(price.get("current_price")),
+                  fmt_num(price.get("change")),
+                  pe, roe, npm, rev5, de, beta,
+                  news_score(sentiments), h]
         return "|".join(fields)
-
 
 # ---------------------------
 # Tool interface
 # ---------------------------
 
 from pydantic import BaseModel, Field
-
 
 class Tools:
     class Valves(BaseModel):
@@ -1147,16 +903,9 @@ class Tools:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "tickers": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Array of tickers, e.g. ['AAPL','MSFT']",
-                            },
-                            "ticker": {
-                                "type": "string",
-                                "description": "(Legacy) CSV like 'AAPL,MSFT'. Prefer `tickers`.",
-                            },
-                        },
+                            "tickers": {"type": "array", "items": {"type": "string"}, "description": "Array of tickers, e.g. ['AAPL','MSFT']"},
+                            "ticker": {"type": "string", "description": "(Legacy) CSV like 'AAPL,MSFT'. Prefer `tickers`."}
+                        }
                     },
                 },
             },
@@ -1169,11 +918,8 @@ class Tools:
                         "type": "object",
                         "properties": {
                             "tickers": {"type": "array", "items": {"type": "string"}},
-                            "ticker": {
-                                "type": "string",
-                                "description": "(Legacy) CSV; prefer `tickers`.",
-                            },
-                        },
+                            "ticker": {"type": "string", "description": "(Legacy) CSV; prefer `tickers`."}
+                        }
                     },
                 },
             },
@@ -1186,11 +932,8 @@ class Tools:
                         "type": "object",
                         "properties": {
                             "tickers": {"type": "array", "items": {"type": "string"}},
-                            "ticker": {
-                                "type": "string",
-                                "description": "(Legacy) CSV; prefer `tickers`.",
-                            },
-                        },
+                            "ticker": {"type": "string", "description": "(Legacy) CSV; prefer `tickers`."}
+                        }
                     },
                 },
             },
@@ -1198,89 +941,52 @@ class Tools:
 
     # ---- public fns ----
 
-    async def compile_stock_report(
-        self,
-        tickers: Optional[List[str]] = None,
-        ticker: str = "",
-        __user__={},
-        __event_emitter__=None,
-    ) -> str:
+    async def compile_stock_report(self, tickers: Optional[List[str]] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
         syms = self._normalize_symbols(tickers, ticker)
-        return await self._execute(
-            syms, mode="full", __user__=__user__, __event_emitter__=__event_emitter__
-        )
+        return await self._execute(syms, mode="full", __user__=__user__, __event_emitter__=__event_emitter__)
 
-    async def get_stock_summary(
-        self,
-        tickers: Optional[List[str]] = None,
-        ticker: str = "",
-        __user__={},
-        __event_emitter__=None,
-    ) -> str:
+    async def get_stock_summary(self, tickers: Optional[List[str]] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
         syms = self._normalize_symbols(tickers, ticker)
-        return await self._execute(
-            syms,
-            mode="optimized",
-            __user__=__user__,
-            __event_emitter__=__event_emitter__,
-        )
+        return await self._execute(syms, mode="optimized", __user__=__user__, __event_emitter__=__event_emitter__)
 
-    async def get_stock_data_compact(
-        self,
-        tickers: Optional[List[str]] = None,
-        ticker: str = "",
-        __user__={},
-        __event_emitter__=None,
-    ) -> str:
+    async def get_stock_data_compact(self, tickers: Optional[List[str]] = None, ticker: str = "", __user__={}, __event_emitter__=None) -> str:
         syms = self._normalize_symbols(tickers, ticker)
-        return await self._execute(
-            syms, mode="compact", __user__=__user__, __event_emitter__=__event_emitter__
-        )
+        return await self._execute(syms, mode="compact", __user__=__user__, __event_emitter__=__event_emitter__)
 
     # ---- internals ----
 
-    def _normalize_symbols(
-        self, tickers: Optional[List[str]], ticker: str
-    ) -> List[str]:
-        if tickers and isinstance(tickers, list):
-            out = [str(t).strip().upper() for t in tickers if str(t).strip()]
-            if out:
-                return out
+    def _normalize_symbols(self, tickers: Optional[List[str]], ticker: str) -> List[str]:
+        tickers = tickers or []
+        if tickers and isinstance(tickers, list) and len(tickers):
+             return [t.strip().upper() for t in tickers if t and str(t).strip()]
         if ticker:
             return [t.strip().upper() for t in str(ticker).split(",") if t.strip()]
         raise ValueError("No tickers provided")
 
-    async def _execute(
-        self,
-        symbols: List[str],
-        mode: str,
-        __user__: dict,
-        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]],
-    ) -> str:
+    async def _execute(self, symbols: List[str], mode: str, __user__: dict, __event_emitter__: Optional[Callable[[Any], Awaitable[None]]]) -> str:
         try:
             logger.info(f"Start {mode} analysis: {symbols}")
             if not self.valves.FINNHUB_API_KEY:
                 raise RuntimeError("FINNHUB_API_KEY not provided in valves")
 
+            # reset in-batch memo for each run
+            _batch_quote_cache.clear()
+            _batch_etf_extras_cache.clear()
+
             client = finnhub.Client(api_key=self.valves.FINNHUB_API_KEY)
             cache_path = os.path.join(os.path.dirname(__file__), "stock_cache_shelve")
 
+            # compact mode: skip news entirely for speed
+            #include_news = mode != "compact"
+            include_news = True
             with shelve.open(cache_path, writeback=True) as cache:
                 parts: List[str] = []
                 total = len(symbols)
 
                 for i, sym in enumerate(symbols, 1):
                     if __event_emitter__ and (i == total or i % 4 == 1):
-                        await __event_emitter__(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"Retrieving data for {sym} ({i}/{total})",
-                                    "done": False,
-                                },
-                            }
-                        )
-                    data = await gather_stock_data(client, sym, cache)
+                        await __event_emitter__({"type": "status", "data": {"description": f"Retrieving data for {sym} ({i}/{total})", "done": False}})
+                    data = await gather_stock_data(client, sym, cache, include_news=include_news)
 
                     if mode == "full":
                         rep = compile_report_human(data)
@@ -1296,23 +1002,13 @@ class Tools:
                     parts.append(rep)
 
                 if __event_emitter__:
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Finished {mode} analysis",
-                                "done": True,
-                            },
-                        }
-                    )
+                    await __event_emitter__({"type": "status", "data": {"description": f"Finished {mode} analysis", "done": True}})
 
             logger.info(f"Done {mode} analysis")
             if mode == "compact":
-                schema = (
-                    "SCHEMA: S = Stock: ticker|price_usd|chg_day_pct|pe_ratio|roe_pct|npm_pct|rev5y_pct|de_ratio|beta|news_score_0to1|health_score_0to1\n"
-                    "F = Fund/ETF: ticker|price_usd|chg_day_pct|exp_ratio_pct|yield_pct|ytd_pct|category|nav_usd|aum_millions|news_score_0to1|health_score_0to1\n"
-                    "* '_0to1' fields are normalized scores: 0.0=low, 0.5=neutral, 1.0=high.\n"
-                )
+                schema = ("SCHEMA: S = Stock: ticker|price_usd|chg_day_pct|pe_ratio|roe_pct|npm_pct|rev5y_pct|de_ratio|beta|news_score_0to1|health_score_0to1\n"
+                          "F = Fund/ETF: ticker|price_usd|chg_day_pct|exp_ratio_pct|yield_pct|ytd_pct|category|nav_usd|aum_millions|news_score_0to1|health_score_0to1\n"
+                          "* '_0to1' fields are normalized scores: 0.0=low, 0.5=neutral, 1.0=high.\n")
                 return f"{schema}\n" + "\n".join(parts)
             return f"Analysis for {symbols}:\n\n" + "".join(parts)
 

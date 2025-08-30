@@ -5,6 +5,8 @@ from typing import List, Optional, Union
 from pydantic import BaseModel
 import sympy as sp
 from datetime import datetime
+import re
+from math import fabs
 
 # Set up basic logging configuration
 logging.basicConfig(
@@ -22,7 +24,7 @@ class Tools:
         self.encryption = encryption  # Option for memory encryption
         self.load_memory()  # Load existing memory from the specified JSON file
 
-    def message_handler(self, message: str) -> str:
+    def message_handler(self, message: str, additional_data: Optional[str] = None ) -> str:
         """
         Handle incoming messages and determine the appropriate action.
 
@@ -30,10 +32,13 @@ class Tools:
         :return: The response based on the message.
         """
         # Normalize the message for easier processing
-        message = message.strip().lower()
+        low = message.strip().lower()
 
         # Check for existing memory and respond appropriately
         response = ""
+
+        if ("compare" in low and "percent" in low) or "largest move" in low:
+            return self.compare_pct_changes_from_memory(additional_data)
 
         command_mapping = {
             "calculate": self.calculator,
@@ -43,15 +48,15 @@ class Tools:
         }
 
         for command, action in command_mapping.items():
-            if message.startswith(command):
+            if low.startswith(command):
                 if command == "calculate":
-                    equation = message[len(command) :].strip()  # Extract the equation
+                    equation = low[len(command) :].strip()  # Extract the equation
                     response = action(equation)
                 else:
                     response = action()  # Call action without parameters
                 break
         else:
-            response = self.handle_unrecognized_message(message)
+            response = self.handle_unrecognized_message(low)
 
         # Reset to initial state if needed
         self.reset_state()
@@ -82,6 +87,52 @@ class Tools:
         }
         return responses.get(message, "I didn't understand that.")
 
+    def compare_pct_changes_from_memory(self, data: Optional[str] = None) -> str:
+        """
+        Scan recent memory for lines like:
+        AAPL ... Current Price: 227.76 (+1.23%)
+        and report the largest move (by absolute %).
+        
+        :param data: Optional stock data to analyze instead of memory
+        """
+        # If data is provided, use it instead of memory
+        if data:
+            text = data
+        else:
+            # join memory into one searchable blob; newest first
+            text = "\n".join(reversed(self.memory)) if self.memory else ""
+
+        if not text:
+            return ("I can compare percentage changes once I see today's compact "
+                    "stock lines like `AAPL ... Current Price: 227.76 (+1.23%)`.")
+
+        # regex: ticker (1–5 caps) ... (±d.dd%)
+        pat = re.compile(r"\b([A-Z]{1,5})\b[^\n\r]*?\(\s*([+\-]?\d+(?:\.\d+)?)%\s*\)")
+        pairs = pat.findall(text)
+
+        if not pairs:
+            return ("I couldn't find any percentage changes. Make sure the ultra "
+                    "compact lines include something like `(−0.85%)` for each ticker.")
+
+        # keep the latest % per ticker (because memory may have multiple runs)
+        latest = {}
+        for t, pct in pairs:
+            latest[t] = float(pct)
+
+        # compute largest by absolute move
+        winner = max(latest.items(), key=lambda kv: fabs(kv[1]))
+        ticker, move = winner
+
+        # pretty output sorted by absolute move
+        sorted_moves = sorted(latest.items(), key=lambda kv: fabs(kv[1]), reverse=True)
+        ranked = " / ".join([f"{t}: {v:+.2f}%" for t, v in sorted_moves])
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        return (f"Date: {today}\n"
+                f"Largest move: {ticker} ({move:+.2f}%)\n"
+                f"All moves: {ranked}")
+    
+    
     def calculator(self, equation: str) -> str:
         """
         Calculate the numeric result of an equation safely.
