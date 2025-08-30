@@ -312,3 +312,4 @@ class Tools:
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": f"Search for '{query}' complete.", "done": True}})
         return format_posts_to_human_readable(posts)
+
