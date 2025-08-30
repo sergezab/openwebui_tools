@@ -330,9 +330,11 @@ def _get_sentiment_model():
         model_name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
         
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # Add low_cpu_mem_usage=False to force direct loading and prevent meta device issues.
-        model = AutoModelForSequenceClassification.from_pretrained(model_name, low_cpu_mem_usage=False)
-        model.to(device)
+        # Using device_map is the modern way to handle device placement with Accelerate.
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, 
+            device_map=device
+        )
 
         # Store the loaded model in the global cache.
         _sentiment_model_cache["tokenizer"] = tokenizer
@@ -416,30 +418,30 @@ async def _analyze_sentiment(title: str, summary: str) -> Dict[str, Any]:
 # ==============================================================================
 # endregion
 
-# region: --- Core Data Gathering Logic ---
+# region: --- Classification Helpers ---
 # ==============================================================================
-def is_etf_or_fund(profile: dict) -> Tuple[bool, str]:
-    """Determine if a security is an ETF or fund based on its profile."""
+COMMON_MMFS = {"snsxx","vusxx"}
+COMMON_ETFS = {"spy","qqq","voo","dia","iwm","vti","gld","xlf","xle","xlu","vnq","kweb","ihi","ewz","bnd","vwo","botz"}
+
+def classify_security(profile: Dict[str, Any]) -> Tuple[bool, str]:
+    """Returns (is_fund, type_str)"""
     if not profile:
         return False, "Stock"
-
-    name = profile.get("name", "").lower()
-    ticker = profile.get("ticker", "").lower()
-
-    mmf_keywords = ["money market", "cash reserves", "treasury", "govt"]
-    if any(kw in name for kw in mmf_keywords) or ticker.endswith("xx"):
+    name = (profile.get("name") or "").lower()
+    ticker = (profile.get("ticker") or "").lower()
+    stype = (profile.get("finnhubIndustry") or "").lower() # Use finnhubIndustry as a proxy for type
+    if ticker in COMMON_MMFS or any(k in name for k in ["money market","cash reserves","liquidity fund","treasury","govt"]):
         return True, "Money Market Fund"
-
-    etf_keywords = ["etf", "exchange traded fund", "index fund", "shares"]
-    if any(kw in name for kw in etf_keywords):
+    if ticker in COMMON_ETFS or any(k in name for k in ["etf", "exchange traded fund", "index fund", "index trust"]) or ticker.endswith("etf"):
         return True, "ETF"
-
-    common_etfs = {"spy", "qqq", "voo", "dia", "iwm", "vti", "gld", "xlf", "xle"}
-    if ticker in common_etfs:
+    if stype and ("etf" in stype or "fund" in stype or "investment" in stype):
         return True, "ETF"
-
     return False, "Stock"
+# ==============================================================================
+# endregion
 
+# region: --- Core Data Gathering Logic ---
+# ==============================================================================
 async def _async_gather_stock_data(
     client: finnhub.Client, ticker: str, cache: shelve.Shelf
 ) -> Dict[str, Any]:
@@ -487,7 +489,7 @@ async def _async_gather_stock_data(
         sentiment_results = ticker_cache["sentiments"]["data"]
     
     # 4. Handle ETFs
-    is_fund, fund_type = is_etf_or_fund(basic_info.get("profile", {}))
+    is_fund, fund_type = classify_security(basic_info.get("profile", {}))
     etf_data = {}
     if is_fund:
         if not _is_cache_valid(ticker_cache, "etf_data"):
@@ -668,27 +670,35 @@ def _compile_compact_report(data: Dict[str, Any]) -> str:
         except (ZeroDivisionError, TypeError):
             return "0.5"
 
+    def _get_health_score_numeric(health_str: str) -> str:
+        """Converts health string to a numeric score."""
+        if "Strong" in health_str: return "0.8"
+        if "Weak" in health_str: return "0.2"
+        return "0.5"
+
     news_score = _get_news_score(sentiments)
 
     if data["is_etf"]:
         etf_data = data.get("etf_data", {})
+        health_score = "0.5" # Default for funds
         fields = [
             "F", ticker,
             _fmt(price.get('current_price'), 2), _fmt(price.get('change'), 1),
             _fmt(etf_data.get('expense_ratio'), 2), _fmt(etf_data.get('yield'), 2),
             _fmt(etf_data.get('ytd_return'), 2), profile.get('finnhubIndustry', '')[:10],
-            news_score,  # Add news score
-            "0.5"        # Add default health score for ETFs
+            health_score,
+            news_score
         ]
     else:
-        health = assess_financial_health(metrics, profile.get("finnhubIndustry", ""))
+        health_str = assess_financial_health(metrics, profile.get("finnhubIndustry", ""))
+        health_score = _get_health_score_numeric(health_str)
         fields = [
             "S", ticker,
             _fmt(price.get('current_price'), 2), _fmt(price.get('change'), 1),
             _fmt(metrics.get('peTTM'), 1), _fmt(metrics.get('roeTTM'), 1),
             _fmt(metrics.get('netProfitMarginTTM'), 1), _fmt(metrics.get('totalDebt/totalEquityQuarterly'), 2),
-            health,
-            news_score  # Add news score
+            health_score,
+            news_score
         ]
     return "|".join(str(f) for f in fields)
 # ==============================================================================
@@ -760,11 +770,12 @@ class Tools:
         all_reports = []
         try:
             with shelve.open(cache_path, writeback=True) as cache:
+                total_tickers = len(unique_tickers)
                 for i, ticker in enumerate(unique_tickers):
-                    if __event_emitter__:
+                    if __event_emitter__ and (i % 4 == 0 or i == total_tickers - 1):
                         await __event_emitter__({
                             "type": "status",
-                            "data": {"description": f"Processing {ticker} ({i+1}/{len(unique_tickers)})...", "done": False}
+                            "data": {"description": f"Processing {ticker} ({i+1}/{total_tickers})...", "done": False}
                         })
                     
                     try:
@@ -792,8 +803,8 @@ class Tools:
         if report_format == "compact":
             schema = (
                 "SCHEMA:\n"
-                "S|ticker|price|day_chg%|pe|roe%|net_margin%|d/e|health|news_score\n"
-                "F|ticker|price|day_chg%|expense%|yield%|ytd%|category|news_score|health_score\n---\n"
+                "S|ticker|price|day_chg%|pe|roe%|net_margin%|d/e|health_score|news_score\n"
+                "F|ticker|price|day_chg%|expense%|yield%|ytd%|category|health_score|news_score\n---\n"
             )
             return schema + final_output
 
