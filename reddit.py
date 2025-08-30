@@ -219,7 +219,8 @@ class Tools:
     async def _make_request(self, url: str, headers: dict, cache_key: str, __event_emitter__):
         with shelve.open(self.cache_path) as cache:
             if cache_key in cache and not is_cache_stale(cache[cache_key]):
-                await __event_emitter__({"type": "status", "data": {"description": f"Loading '{cache_key}' from cache.", "done": False}})
+                if __event_emitter__:
+                    await __event_emitter__({"type": "status", "data": {"description": f"Loading '{cache_key}' from cache.", "done": False}})
                 return cache[cache_key]["data"]
 
             try:
@@ -241,13 +242,18 @@ class Tools:
         cache_key = f"subreddit_{subreddit}"
         headers = {"User-Agent": __user__.get("valves", self.UserValves()).USER_AGENT}
         
-        await __event_emitter__({"type": "status", "data": {"description": f"Fetching feed for r/{subreddit}...", "done": False}})
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Fetching feed for r/{subreddit}...", "done": False}})
         result = await self._make_request(url, headers, cache_key, __event_emitter__)
 
         if isinstance(result, str): # It's an error message
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": f"Failed to get feed for r/{subreddit}.", "done": True}})
             return result
         
         posts = parse_posts(result)
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Feed for r/{subreddit} retrieved.", "done": True}})
         return format_posts_to_human_readable(posts)
 
     async def get_user_feed(self, username: str, __user__={}, __event_emitter__=None) -> str:
@@ -258,10 +264,13 @@ class Tools:
         cache_key = f"user_{username}"
         headers = {"User-Agent": __user__.get("valves", self.UserValves()).USER_AGENT}
 
-        await __event_emitter__({"type": "status", "data": {"description": f"Fetching feed for u/{username}...", "done": False}})
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Fetching feed for u/{username}...", "done": False}})
         result = await self._make_request(url, headers, cache_key, __event_emitter__)
 
         if isinstance(result, str):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": f"Failed to get feed for u/{username}.", "done": True}})
             return result
             
         posts = parse_posts(result)
@@ -270,6 +279,8 @@ class Tools:
         formatted_posts = f"--- POSTS ---\n{format_posts_to_human_readable(posts)}" if posts else ""
         formatted_comments = f"\n\n--- COMMENTS ---\n{format_comments_to_human_readable(comments)}" if comments else ""
 
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Feed for u/{username} retrieved.", "done": True}})
         if not formatted_posts and not formatted_comments:
             return "No activity found for this user."
             
@@ -288,15 +299,16 @@ class Tools:
             
         cache_key = f"v2_search_{subreddit}_{query}"
 
-        await __event_emitter__({"type": "status", "data": {"description": f"Searching for '{query}' in {search_scope}...", "done": False}})
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Searching for '{query}' in {search_scope}...", "done": False}})
         result = await self._make_request(url, headers, cache_key, __event_emitter__)
 
         if isinstance(result, str):
+            if __event_emitter__:
+                await __event_emitter__({"type": "status", "data": {"description": f"Search for '{query}' failed.", "done": True}})
             return result
 
         posts = parse_posts(result)
+        if __event_emitter__:
+            await __event_emitter__({"type": "status", "data": {"description": f"Search for '{query}' complete.", "done": True}})
         return format_posts_to_human_readable(posts)
-
-
-
-
